@@ -93,21 +93,23 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 	result.Modified = len(diff.Modified)
 	result.Removed = len(diff.Removed)
 
+	progress := NewProgress()
+
 	if result.Added == 0 && result.Modified == 0 && result.Removed == 0 {
-		log.Info("nothing to compile")
+		fmt.Fprintln(os.Stderr, "✓ Nothing to compile — wiki is up to date.")
 		return result, nil
 	}
 
 	if opts.DryRun {
-		log.Info("dry run — showing changes only")
+		fmt.Fprintln(os.Stderr, "Dry run — changes that would be applied:")
 		for _, s := range diff.Added {
-			fmt.Printf("  + %s (%s)\n", s.Path, s.Type)
+			fmt.Fprintf(os.Stderr, "  + %s (%s)\n", s.Path, s.Type)
 		}
 		for _, s := range diff.Modified {
-			fmt.Printf("  ~ %s (%s)\n", s.Path, s.Type)
+			fmt.Fprintf(os.Stderr, "  ~ %s (%s)\n", s.Path, s.Type)
 		}
 		for _, p := range diff.Removed {
-			fmt.Printf("  - %s\n", p)
+			fmt.Fprintf(os.Stderr, "  - %s\n", p)
 		}
 		return result, nil
 	}
@@ -172,7 +174,7 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 		log.Info("new sources detected, resetting to Pass 1")
 		state.Pass = 1
 	}
-	log.Info("Pass 1: summarizing sources", "count", len(toProcess))
+	progress.StartPhase("Pass 1: Summarize sources", len(toProcess))
 
 	model := cfg.Models.Summarize
 	if model == "" {
@@ -188,6 +190,7 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 	for _, sr := range summaries {
 		if sr.Error != nil {
 			result.Errors++
+			progress.ItemError(sr.SourcePath, sr.Error)
 			state.Failed = append(state.Failed, FailedSource{
 				Path:  sr.SourcePath,
 				Error: sr.Error.Error(),
@@ -196,6 +199,7 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 		}
 
 		result.Summarized++
+		progress.ItemDone(sr.SourcePath, sr.SummaryPath)
 
 		// Update manifest
 		src := mf.Sources[sr.SourcePath]
@@ -248,18 +252,22 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 			extractModel = model
 		}
 
-		log.Info("Pass 2: extracting concepts", "from_summaries", len(successfulSummaries))
+		progress.StartPhase("Pass 2: Extract concepts", len(successfulSummaries))
 		concepts, err := ExtractConcepts(successfulSummaries, mf.Concepts, client, extractModel)
 		if err != nil {
-			log.Error("concept extraction failed", "error", err)
+			progress.ItemError("concept extraction", err)
 			result.Errors++
 		} else {
 			result.ConceptsExtracted = len(concepts)
 
-			// Update manifest with concepts
+			// Report discovered concepts
+			var conceptNames []string
 			for _, c := range concepts {
+				conceptNames = append(conceptNames, c.Name)
 				mf.AddConcept(c.Name, filepath.Join(cfg.Output, "concepts", c.Name+".md"), c.Sources)
 			}
+			progress.ConceptsDiscovered(conceptNames)
+			progress.EndPhase()
 
 			// Pass 3: Write articles
 			if len(concepts) > 0 {
@@ -274,16 +282,19 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 
 				ontStore := ontology.NewStore(db)
 
-				log.Info("Pass 3: writing articles", "concepts", len(concepts))
+				progress.StartPhase("Pass 3: Write articles", len(concepts))
 				articles := WriteArticles(projectDir, cfg.Output, concepts, client, writeModel, articleMaxTokens, cfg.Compiler.MaxParallel, memStore, vecStore, ontStore, embedder)
 
 				for _, ar := range articles {
 					if ar.Error != nil {
 						result.Errors++
+						progress.ItemError(ar.ConceptName, ar.Error)
 					} else {
 						result.ArticlesWritten++
+						progress.ItemDone(ar.ConceptName, ar.ArticlePath)
 					}
 				}
+				progress.EndPhase()
 			}
 		}
 	}
@@ -323,15 +334,7 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 		gitpkg.AutoCommit(projectDir, commitMsg)
 	}
 
-	log.Info("compilation complete",
-		"added", result.Added,
-		"modified", result.Modified,
-		"removed", result.Removed,
-		"summarized", result.Summarized,
-		"concepts", result.ConceptsExtracted,
-		"articles", result.ArticlesWritten,
-		"errors", result.Errors,
-	)
+	progress.Summary(result)
 
 	return result, nil
 }
