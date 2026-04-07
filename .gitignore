@@ -3,4 +3,6 @@ CLAUDE.md
 .sage/
 sage/
 /sage-wiki
+.gocache/
 bin/
+.gomodcache/
