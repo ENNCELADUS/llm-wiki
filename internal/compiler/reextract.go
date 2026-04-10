@@ -75,7 +75,8 @@ func ReExtract(projectDir string) (*CompileResult, error) {
 
 	memStore := memory.NewStore(db)
 	vecStore := vectors.NewStore(db)
-	ontStore := ontology.NewStore(db)
+	merged := ontology.MergedRelations(cfg.Ontology.Relations)
+	ontStore := ontology.NewStore(db, ontology.ValidRelationNames(merged))
 	embedder := embed.NewFromConfig(cfg)
 
 	// Pass 2: Concept extraction
@@ -107,8 +108,9 @@ func ReExtract(projectDir string) (*CompileResult, error) {
 			articleMaxTokens = 4000
 		}
 
+		relPatterns := ontology.RelationPatterns(merged)
 		log.Info("Pass 3: writing articles", "concepts", len(concepts))
-		articles := WriteArticles(projectDir, cfg.Output, concepts, client, writeModel, articleMaxTokens, cfg.Compiler.MaxParallel, memStore, vecStore, ontStore, embedder, cfg.Compiler.UserTimeLocation(), cfg.Compiler.ArticleFields)
+		articles := WriteArticles(projectDir, cfg.Output, concepts, client, writeModel, articleMaxTokens, cfg.Compiler.MaxParallel, memStore, vecStore, ontStore, embedder, cfg.Compiler.UserTimeLocation(), cfg.Compiler.ArticleFields, relPatterns)
 
 		for _, ar := range articles {
 			if ar.Error != nil {

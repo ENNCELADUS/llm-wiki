@@ -42,6 +42,7 @@ func WriteArticles(
 	embedder embed.Embedder,
 	userTZ *time.Location,
 	articleFields []string,
+	relationPatterns []ontology.RelationPattern,
 ) []ArticleResult {
 	if maxParallel <= 0 {
 		maxParallel = 4
@@ -61,7 +62,7 @@ func WriteArticles(
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			result := writeOneArticle(projectDir, outputDir, c, client, model, maxTokens, memStore, vecStore, ontStore, embedder, userTZ, articleFields)
+			result := writeOneArticle(projectDir, outputDir, c, client, model, maxTokens, memStore, vecStore, ontStore, embedder, userTZ, articleFields, relationPatterns)
 			results[idx] = result
 
 			n := int(done.Add(1))
@@ -90,6 +91,7 @@ func writeOneArticle(
 	embedder embed.Embedder,
 	userTZ *time.Location,
 	articleFields []string,
+	relationPatterns []ontology.RelationPattern,
 ) ArticleResult {
 	result := ArticleResult{ConceptName: concept.Name}
 
@@ -192,7 +194,7 @@ func writeOneArticle(
 	}
 
 	// Extract typed relations from article text
-	extractRelations(concept.Name, articleContent, ontStore)
+	extractRelations(concept.Name, articleContent, ontStore, relationPatterns)
 
 	// Index in FTS5
 	if err := memStore.Add(memory.Entry{
@@ -371,7 +373,7 @@ func findRelatedConcepts(concept ExtractedConcept) []string {
 
 // extractRelations parses article text for relationship patterns and creates ontology edges.
 // Looks for patterns like "X implements Y", "X extends Y", etc. near [[wikilinks]].
-func extractRelations(conceptID string, content string, ontStore *ontology.Store) {
+func extractRelations(conceptID string, content string, ontStore *ontology.Store, patterns []ontology.RelationPattern) {
 	linkRe := regexp.MustCompile(`\[\[([^\]]+)\]\]`)
 	links := linkRe.FindAllStringSubmatch(content, -1)
 
@@ -386,30 +388,17 @@ func extractRelations(conceptID string, content string, ontStore *ontology.Store
 
 	contentLower := strings.ToLower(content)
 
-	// Pattern matching for relation types
-	relationPatterns := []struct {
-		keywords []string
-		relation string
-	}{
-		{[]string{"implements", "implementation of", "is an implementation", "实现了", "实现方式"}, ontology.RelImplements},
-		{[]string{"extends", "extension of", "builds on", "builds upon", "扩展了", "基于"}, ontology.RelExtends},
-		{[]string{"optimizes", "optimization of", "improves upon", "faster than", "优化了", "改进了", "提升了"}, ontology.RelOptimizes},
-		{[]string{"contradicts", "conflicts with", "disagrees with", "challenges", "矛盾", "冲突", "挑战了"}, ontology.RelContradicts},
-		{[]string{"prerequisite", "requires knowledge of", "depends on", "built on top of", "前提", "依赖于", "前置条件"}, ontology.RelPrerequisiteOf},
-		{[]string{"trade-off", "tradeoff", "trades off", "at the cost of", "取舍", "权衡", "代价是"}, ontology.RelTradesOff},
-	}
-
 	for target := range linkedConcepts {
 		targetLower := strings.ToLower(target)
-		for _, rp := range relationPatterns {
-			for _, keyword := range rp.keywords {
+		for _, rp := range patterns {
+			for _, keyword := range rp.Keywords {
 				// Look for the keyword near the concept mention
 				if strings.Contains(contentLower, keyword) && strings.Contains(contentLower, targetLower) {
 					ontStore.AddRelation(ontology.Relation{
-						ID:       conceptID + "-" + rp.relation + "-" + target,
+						ID:       conceptID + "-" + rp.Relation + "-" + target,
 						SourceID: conceptID,
 						TargetID: target,
-						Relation: rp.relation,
+						Relation: rp.Relation,
 					})
 					break // one relation type per target is enough
 				}

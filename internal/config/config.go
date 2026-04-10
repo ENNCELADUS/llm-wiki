@@ -4,11 +4,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
+
+var relationNameRe = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
 // Config represents the sage-wiki project configuration.
 type Config struct {
@@ -26,6 +29,7 @@ type Config struct {
 	Search      SearchConfig   `yaml:"search"`
 	Linting     LintingConfig  `yaml:"linting"`
 	Serve       ServeConfig    `yaml:"serve"`
+	Ontology    OntologyConfig `yaml:"ontology,omitempty"`
 }
 
 type VaultConfig struct {
@@ -93,6 +97,17 @@ type LintingConfig struct {
 type ServeConfig struct {
 	Transport string `yaml:"transport"`
 	Port      int    `yaml:"port"`
+}
+
+// OntologyConfig configures ontology relation types.
+type OntologyConfig struct {
+	Relations []RelationConfig `yaml:"relations,omitempty"`
+}
+
+// RelationConfig defines a custom or extended relation type.
+type RelationConfig struct {
+	Name     string   `yaml:"name"`
+	Synonyms []string `yaml:"synonyms"`
 }
 
 // Defaults returns a Config with sensible defaults for greenfield mode.
@@ -212,6 +227,14 @@ func (c *Config) Validate() error {
 		validModes := map[string]bool{"standard": true, "batch": true, "auto": true}
 		if !validModes[c.Compiler.Mode] {
 			return fmt.Errorf("config: invalid compiler.mode %q (valid: standard, batch, auto)", c.Compiler.Mode)
+		}
+	}
+	for _, r := range c.Ontology.Relations {
+		if r.Name == "" {
+			return fmt.Errorf("config: ontology.relations: name is required")
+		}
+		if !relationNameRe.MatchString(r.Name) {
+			return fmt.Errorf("config: ontology.relations: invalid name %q (must match [a-z][a-z0-9_]*)", r.Name)
 		}
 	}
 	if c.Compiler.Timezone != "" {

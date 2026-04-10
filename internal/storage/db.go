@@ -137,6 +137,7 @@ func (db *DB) migrate() error {
 
 	migrations := []string{
 		migrationV1,
+		migrationV2,
 	}
 
 	for i := version; i < len(migrations); i++ {
@@ -192,10 +193,7 @@ CREATE TABLE IF NOT EXISTS relations (
 	id TEXT PRIMARY KEY,
 	source_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
 	target_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
-	relation TEXT NOT NULL CHECK(relation IN (
-		'implements','extends','optimizes','contradicts',
-		'cites','prerequisite_of','trades_off','derived_from'
-	)),
+	relation TEXT NOT NULL,
 	metadata JSON,
 	created_at TEXT,
 	UNIQUE(source_id, target_id, relation)
@@ -214,4 +212,26 @@ CREATE TABLE IF NOT EXISTS learnings (
 	created_at TEXT,
 	source_lint_pass TEXT
 );
+`
+
+// migrationV2 removes the CHECK constraint on relations.relation to support custom types.
+// SQLite doesn't support ALTER TABLE DROP CONSTRAINT, so we recreate the table.
+const migrationV2 = `
+CREATE TABLE IF NOT EXISTS relations_new (
+	id TEXT PRIMARY KEY,
+	source_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+	target_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+	relation TEXT NOT NULL,
+	metadata JSON,
+	created_at TEXT,
+	UNIQUE(source_id, target_id, relation)
+);
+
+INSERT OR IGNORE INTO relations_new SELECT * FROM relations;
+DROP TABLE IF EXISTS relations;
+ALTER TABLE relations_new RENAME TO relations;
+
+CREATE INDEX IF NOT EXISTS idx_relations_source ON relations(source_id);
+CREATE INDEX IF NOT EXISTS idx_relations_target ON relations(target_id);
+CREATE INDEX IF NOT EXISTS idx_relations_type ON relations(relation);
 `

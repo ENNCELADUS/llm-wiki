@@ -355,15 +355,17 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 					articleMaxTokens = 4000
 				}
 
-				ontStore := ontology.NewStore(db)
+				merged := ontology.MergedRelations(cfg.Ontology.Relations)
+				ontStore := ontology.NewStore(db, ontology.ValidRelationNames(merged))
 
 				client.SetPass("write")
 				var writeCacheID string
 				if cacheEnabled {
 					writeCacheID, _ = client.SetupCache("You are a knowledge base article writer. Write comprehensive, well-structured wiki articles.", writeModel)
 				}
+				relPatterns := ontology.RelationPatterns(merged)
 				progress.StartPhase("Pass 3: Write articles", len(concepts))
-				articles := WriteArticles(projectDir, cfg.Output, concepts, client, writeModel, articleMaxTokens, cfg.Compiler.MaxParallel, memStore, vecStore, ontStore, embedder, cfg.Compiler.UserTimeLocation(), cfg.Compiler.ArticleFields)
+				articles := WriteArticles(projectDir, cfg.Output, concepts, client, writeModel, articleMaxTokens, cfg.Compiler.MaxParallel, memStore, vecStore, ontStore, embedder, cfg.Compiler.UserTimeLocation(), cfg.Compiler.ArticleFields, relPatterns)
 
 				for _, ar := range articles {
 					if ar.Error != nil {
@@ -755,11 +757,13 @@ func resumeBatch(
 					articleMaxTokens = 4000
 				}
 
-				ontStore := ontology.NewStore(db)
+				merged := ontology.MergedRelations(cfg.Ontology.Relations)
+				ontStore := ontology.NewStore(db, ontology.ValidRelationNames(merged))
 				client.SetPass("write")
 				writeCacheID, _ := client.SetupCache("You are a knowledge base article writer. Write comprehensive, well-structured wiki articles.", writeModel)
+				relPatterns := ontology.RelationPatterns(merged)
 				progress.StartPhase("Pass 3: Write articles", len(concepts))
-				articles := WriteArticles(projectDir, cfg.Output, concepts, client, writeModel, articleMaxTokens, cfg.Compiler.MaxParallel, memStore, vecStore, ontStore, embedder, cfg.Compiler.UserTimeLocation(), cfg.Compiler.ArticleFields)
+				articles := WriteArticles(projectDir, cfg.Output, concepts, client, writeModel, articleMaxTokens, cfg.Compiler.MaxParallel, memStore, vecStore, ontStore, embedder, cfg.Compiler.UserTimeLocation(), cfg.Compiler.ArticleFields, relPatterns)
 
 				for _, ar := range articles {
 					if ar.Error != nil {
