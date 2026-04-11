@@ -17,11 +17,13 @@ User Query
   -> Deduplicate to document level (best chunk per doc)
   -> LLM re-ranking (top-15 candidates scored for relevance)
   -> Position-aware blending (retrieval + rerank scores)
-  -> Read full articles + ontology traversal
+  -> Graph-expanded context (4-signal relevance: relations, sources, neighbors, types)
+  -> Read full articles + ontology traversal (depth-1 fallback)
+  -> Token budget control (greedy fill up to context_max_tokens)
   -> LLM synthesis
 ```
 
-The original document-level pipeline remains as a fallback when chunk data is unavailable.
+The original document-level pipeline remains as a fallback when chunk data is unavailable. Graph expansion works on both paths.
 
 ## Key features
 
@@ -59,6 +61,31 @@ This ensures that if RRF placed something at rank 1 with high confidence, the re
 
 Instead of brute-force scanning all chunk vectors, the enhanced pipeline uses BM25 results as a candidate filter. Vector comparisons are limited to chunks from the top 50 BM25 documents, capping cosine computations at ~250 regardless of wiki size.
 
+### Graph-enhanced context expansion
+
+After retrieval, a 4-signal graph relevance scorer discovers related articles via the ontology that keyword/vector search may have missed:
+
+| Signal | Weight | How it works |
+|---|---|---|
+| **Direct link** | 3.0 | Ontology relation exists between a search result and the candidate (excluding `cites` edges) |
+| **Source overlap** | 4.0 | Both concepts were generated from the same source document (via shared `cites` edges in ontology) |
+| **Common neighbor** | 1.5 | Adamic-Adar index: shared ontology neighbors weighted by `1/log(degree)` — common neighbors that are themselves highly connected contribute less |
+| **Type affinity** | 1.0 | Bonus for cross-type pairs (e.g., concept↔technique scores 1.2, same-type scores 0.5-0.8) |
+
+Source overlap is the highest-weighted signal because articles generated from the same document are inherently related — and this costs zero compute (just set intersection on existing ontology `cites` edges).
+
+Graph expansion is applied **before** both the enhanced (chunk-level) and document-level search sub-functions, so both code paths benefit uniformly. Expanded articles are added to the context with `### Graph-related:` headers and tracked in `QueryResult.Sources` for provenance.
+
+### Token budget control
+
+The query context is capped at a configurable token limit (default 8000). Articles are prioritized by combined score (RRF + graph relevance) and filled greedily:
+
+1. Primary search results first (from hybrid search)
+2. Graph-expanded articles next (sorted by relevance score)
+3. Depth-1 ontology traversal last (fallback for articles not yet included)
+
+Each article is truncated at 4000 tokens (16000 chars, using chars/4 estimation). When the budget is exhausted, remaining articles are skipped.
+
 ## Configuration
 
 All features are enabled by default with zero config. Add these to `config.yaml` to customize:
@@ -71,6 +98,14 @@ search:
   query_expansion: true       # LLM query expansion (default: true)
   rerank: true                # LLM re-ranking (default: true)
   chunk_size: 800             # tokens per chunk for indexing (100-5000, default: 800)
+  graph_expansion: true       # graph-based context expansion (default: true)
+  graph_max_expand: 10        # max articles added via graph
+  graph_depth: 2              # ontology traversal depth (1-5)
+  context_max_tokens: 8000    # token budget for query context
+  weight_direct_link: 3.0     # graph signal weights (all configurable)
+  weight_source_overlap: 4.0
+  weight_common_neighbor: 1.5
+  weight_type_affinity: 1.0
 ```
 
 ### Disabling features
@@ -88,6 +123,10 @@ search:
 search:
   query_expansion: false
   rerank: false
+
+# Disable graph expansion (uses only depth-1 ontology traversal)
+search:
+  graph_expansion: false
 ```
 
 ### Local models (Ollama)
@@ -144,7 +183,7 @@ sage-wiki's enhanced search pipeline was inspired by analyzing [qmd](https://git
 | **Vector search** | BM25-prefiltered (caps at ~250 comparisons) | Brute-force |
 | **Hybrid search** | RRF fusion (BM25 + vector) | Vector-only |
 | **Strong-signal skip** | Yes (normalized BM25 threshold) | No |
-| **Ontology context** | 1-hop graph traversal adds related articles | No graph |
+| **Graph context** | 4-signal expansion (relations, sources, neighbors, types) + 1-hop fallback | No graph |
 | **Model dependency** | Any provider (cloud or local via Ollama) | Local GGUF models |
 | **Cost per query** | Free (Ollama) / ~$0.0006 (cloud) | Free (local) |
 
@@ -152,7 +191,7 @@ Key differences:
 
 - **sage-wiki uses dual-channel retrieval** (BM25 + vector) at both document and chunk level, while qmd relies primarily on vector similarity. BM25 excels at exact keyword matches that vector search misses.
 - **sage-wiki's position-aware blending** protects high-confidence retrieval results from reranker noise, using different weight tiers based on pre-rerank position.
-- **sage-wiki adds ontology context** — after search, related concepts are discovered via graph traversal and added to the LLM synthesis context.
+- **sage-wiki adds graph-enhanced context** — after search, a 4-signal scorer (direct relations, source overlap, Adamic-Adar neighbors, type affinity) finds structurally related articles and adds them to the LLM synthesis context. This goes beyond simple 1-hop traversal — it discovers concepts that share source documents or have common ontology neighbors.
 - **Both support local models for free inference.** qmd uses GGUF via llama.cpp; sage-wiki supports Ollama (or any OpenAI-compatible local server). With Ollama, sage-wiki's enhanced search is completely free — chunk indexing, query expansion, and BM25+vector search all run locally. Re-ranking is auto-disabled for local models but can be force-enabled for capable ones. With cloud LLMs, the additional cost per query is negligible (~$0.0006).
 
 ## Fallback behavior
@@ -162,6 +201,7 @@ The enhanced pipeline degrades gracefully:
 - **No chunks indexed yet** — Falls back to document-level search. Logs: "chunk index empty — using document-level search."
 - **LLM expansion fails** — Uses the raw query without variants.
 - **LLM reranking fails** — Uses RRF order as-is.
+- **Graph expansion fails or empty ontology** — Falls back to depth-1 ontology traversal. Logged at debug level.
 - **No embedder configured** — BM25-only search with expansion keywords.
 - **Empty wiki** — Returns "no results" immediately.
 

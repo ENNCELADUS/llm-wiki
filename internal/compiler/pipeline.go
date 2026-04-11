@@ -28,6 +28,7 @@ type CompileOpts struct {
 	Fresh    bool              // ignore checkpoint
 	Batch    bool              // use batch API (async, 50% discount)
 	NoCache  bool              // disable prompt caching
+	Prune    bool              // delete orphaned articles when sources removed
 	Tracker  *llm.CostTracker  // optional cost tracker
 }
 
@@ -191,6 +192,9 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 	vecStore := vectors.NewStore(db)
 	embedder := embed.NewFromConfig(cfg)
 	chunkStore := memory.NewChunkStore(db)
+
+	merged := ontology.MergedRelations(cfg.Ontology.Relations)
+	pipelineOntStore := ontology.NewStore(db, ontology.ValidRelationNames(merged))
 
 	// Backfill chunk index if needed (after migration, before first compile)
 	if chunkStore.NeedsBackfill(memStore) {
@@ -411,13 +415,8 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 	// Pass 4: Image extraction (placeholder)
 	ExtractImages(projectDir, cfg.Output, toProcess)
 
-	// Handle removed sources
-	for _, removed := range diff.Removed {
-		mf.RemoveSource(removed)
-		memStore.Delete(removed)
-		vecStore.Delete(removed)
-		log.Info("removed source", "path", removed)
-	}
+	// Handle removed sources — detect orphans BEFORE removing from manifest
+	handleRemovedSources(projectDir, diff.Removed, mf, memStore, vecStore, pipelineOntStore, opts.Prune)
 
 	// Save manifest
 	if err := mf.Save(mfPath); err != nil {
@@ -914,6 +913,57 @@ func filterSuccessful(summaries []SummaryResult) []SummaryResult {
 		}
 	}
 	return result
+}
+
+// handleRemovedSources processes removed source files, detecting orphaned articles
+// and optionally pruning them. Must be called BEFORE mf.RemoveSource() since it
+// needs the manifest entries to look up affected concepts.
+func handleRemovedSources(projectDir string, removed []string, mf *manifest.Manifest,
+	memStore *memory.Store, vecStore *vectors.Store, ontStore *ontology.Store, prune bool) {
+
+	for _, removedPath := range removed {
+		affectedConcepts := mf.ArticlesFromSource(removedPath)
+		for _, conceptName := range affectedConcepts {
+			concept, ok := mf.Concepts[conceptName]
+			if !ok {
+				continue
+			}
+			if len(concept.Sources) <= 1 {
+				log.Warn("article orphaned (sole source removed)",
+					"concept", conceptName,
+					"article", concept.ArticlePath,
+					"source", removedPath)
+				if prune {
+					articleAbs := filepath.Join(projectDir, concept.ArticlePath)
+					if err := os.Remove(articleAbs); err != nil && !os.IsNotExist(err) {
+						log.Warn("failed to delete orphaned article", "path", articleAbs, "error", err)
+					} else {
+						log.Info("pruned orphaned article", "concept", conceptName, "path", concept.ArticlePath)
+					}
+					memStore.Delete("concept:" + conceptName)
+					vecStore.Delete("concept:" + conceptName)
+					ontStore.DeleteEntity(conceptName)
+					delete(mf.Concepts, conceptName)
+				}
+			} else {
+				var updated []string
+				for _, s := range concept.Sources {
+					if s != removedPath {
+						updated = append(updated, s)
+					}
+				}
+				concept.Sources = updated
+				mf.Concepts[conceptName] = concept
+				log.Info("updated concept sources (removed source)",
+					"concept", conceptName, "remaining_sources", len(updated))
+			}
+		}
+
+		mf.RemoveSource(removedPath)
+		memStore.Delete(removedPath)
+		vecStore.Delete(removedPath)
+		log.Info("removed source", "path", removedPath)
+	}
 }
 
 func writeChangelog(projectDir string, outputDir string, result *CompileResult, loc *time.Location) error {

@@ -12,6 +12,7 @@ import (
 	"github.com/xoai/sage-wiki/internal/config"
 	"github.com/xoai/sage-wiki/internal/embed"
 	"github.com/xoai/sage-wiki/internal/extract"
+	"github.com/xoai/sage-wiki/internal/graph"
 	"github.com/xoai/sage-wiki/internal/hybrid"
 	"github.com/xoai/sage-wiki/internal/llm"
 	"github.com/xoai/sage-wiki/internal/log"
@@ -142,6 +143,8 @@ func buildQueryContext(projectDir string, question string, topK int, cfg *config
 	chunkStore := memory.NewChunkStore(db)
 	embedder := embed.NewFromConfig(cfg)
 
+	var graphExpanded []graphExpandedArticle
+
 	// Try enhanced search if chunks are available
 	chunkCount, _ := chunkStore.Count()
 	if chunkCount > 0 {
@@ -178,7 +181,12 @@ func buildQueryContext(projectDir string, question string, topK int, cfg *config
 		if err != nil {
 			log.Warn("enhanced search failed, falling back to doc-level", "error", err)
 		} else if len(enhanced) > 0 {
-			return buildContextFromEnhanced(projectDir, cfg.Output, enhanced, ontStore)
+			// Compute graph expansion from enhanced search seeds
+			if cfg.Search.GraphExpansionEnabled() {
+				seedIDs := extractSeedIDsFromEnhanced(enhanced)
+				graphExpanded = computeGraphExpansion(cfg, ontStore, seedIDs)
+			}
+			return buildContextFromEnhanced(projectDir, cfg.Output, enhanced, ontStore, graphExpanded, cfg.Search.ContextMaxTokensOrDefault())
 		}
 	} else if chunkCount == 0 {
 		count, _ := memStore.Count()
@@ -188,14 +196,20 @@ func buildQueryContext(projectDir string, question string, topK int, cfg *config
 	}
 
 	// Fallback: document-level hybrid search
-	return buildDocLevelContext(projectDir, question, topK, memStore, vecStore, ontStore, embedder)
+	return buildDocLevelContext(projectDir, question, topK, memStore, vecStore, ontStore, embedder, cfg, graphExpanded)
 }
 
 // buildContextFromEnhanced assembles article context from enhanced search results.
-func buildContextFromEnhanced(projectDir string, outputDir string, results []search.SearchResult, ontStore *ontology.Store) (string, []string, error) {
+func buildContextFromEnhanced(projectDir string, outputDir string, results []search.SearchResult, ontStore *ontology.Store, graphExpanded []graphExpandedArticle, maxTokens int) (string, []string, error) {
 	var ctx strings.Builder
 	var sources []string
 	seen := map[string]bool{}
+	tokenBudget := maxTokens
+	if tokenBudget <= 0 {
+		tokenBudget = 8000
+	}
+	tokensUsed := 0
+	maxPerArticle := 16000 // 4000 tokens * 4 chars/token
 
 	for _, r := range results {
 		docID := r.DocID
@@ -208,12 +222,45 @@ func buildContextFromEnhanced(projectDir string, outputDir string, results []sea
 		if err != nil {
 			continue
 		}
+		content := string(data)
+		if len(content) > maxPerArticle {
+			content = content[:maxPerArticle]
+		}
+		contentTokens := len(content) / 4
+		if tokensUsed+contentTokens > tokenBudget {
+			break
+		}
 		seen[articlePath] = true
-		ctx.WriteString(fmt.Sprintf("### Source: %s\n%s\n\n---\n\n", articlePath, string(data)))
+		ctx.WriteString(fmt.Sprintf("### Source: %s\n%s\n\n---\n\n", articlePath, content))
 		sources = append(sources, articlePath)
+		tokensUsed += contentTokens
 	}
 
-	// Ontology traversal for related articles
+	// Graph-expanded articles (higher quality than depth-1 BFS)
+	for _, ge := range graphExpanded {
+		if ge.ArticlePath == "" || seen[ge.ArticlePath] {
+			continue
+		}
+		absPath := filepath.Join(projectDir, ge.ArticlePath)
+		data, err := os.ReadFile(absPath)
+		if err != nil {
+			continue
+		}
+		content := string(data)
+		if len(content) > maxPerArticle {
+			content = content[:maxPerArticle]
+		}
+		contentTokens := len(content) / 4
+		if tokensUsed+contentTokens > tokenBudget {
+			break
+		}
+		seen[ge.ArticlePath] = true
+		ctx.WriteString(fmt.Sprintf("### Graph-related: %s\n%s\n\n---\n\n", ge.ArticlePath, content))
+		sources = append(sources, ge.ArticlePath)
+		tokensUsed += contentTokens
+	}
+
+	// Fallback: depth-1 ontology traversal for articles not yet seen
 	for _, r := range results {
 		entityID := r.DocID
 		if len(entityID) > 8 && entityID[:8] == "concept:" {
@@ -227,8 +274,17 @@ func buildContextFromEnhanced(projectDir string, outputDir string, results []sea
 			if rel.ArticlePath != "" && !seen[rel.ArticlePath] {
 				absPath := filepath.Join(projectDir, rel.ArticlePath)
 				if data, err := os.ReadFile(absPath); err == nil {
+					content := string(data)
+					if len(content) > maxPerArticle {
+						content = content[:maxPerArticle]
+					}
+					contentTokens := len(content) / 4
+					if tokensUsed+contentTokens > tokenBudget {
+						break
+					}
 					seen[rel.ArticlePath] = true
-					ctx.WriteString(fmt.Sprintf("### Related: %s\n%s\n\n---\n\n", rel.ArticlePath, string(data)))
+					ctx.WriteString(fmt.Sprintf("### Related: %s\n%s\n\n---\n\n", rel.ArticlePath, content))
+					tokensUsed += contentTokens
 				}
 			}
 		}
@@ -240,7 +296,7 @@ func buildContextFromEnhanced(projectDir string, outputDir string, results []sea
 // buildDocLevelContext is the original document-level search path.
 func buildDocLevelContext(projectDir string, question string, topK int,
 	memStore *memory.Store, vecStore *vectors.Store, ontStore *ontology.Store,
-	embedder embed.Embedder) (string, []string, error) {
+	embedder embed.Embedder, cfg *config.Config, graphExpanded []graphExpandedArticle) (string, []string, error) {
 
 	searcher := hybrid.NewSearcher(memStore, vecStore)
 
@@ -261,6 +317,16 @@ func buildDocLevelContext(projectDir string, question string, topK int,
 		return "", nil, nil
 	}
 
+	// Compute graph expansion from doc-level search seeds if not already done
+	if cfg.Search.GraphExpansionEnabled() && len(graphExpanded) == 0 {
+		seedIDs := extractSeedIDsFromDocLevel(results)
+		graphExpanded = computeGraphExpansion(cfg, ontStore, seedIDs)
+	}
+
+	tokenBudget := cfg.Search.ContextMaxTokensOrDefault()
+	tokensUsed := 0
+	maxPerArticle := 16000 // 4000 tokens * 4 chars/token
+
 	var ctx strings.Builder
 	var sources []string
 	seen := map[string]bool{}
@@ -274,11 +340,45 @@ func buildDocLevelContext(projectDir string, question string, topK int,
 		if err != nil {
 			continue
 		}
+		content := string(data)
+		if len(content) > maxPerArticle {
+			content = content[:maxPerArticle]
+		}
+		contentTokens := len(content) / 4
+		if tokensUsed+contentTokens > tokenBudget {
+			break
+		}
 		seen[r.ArticlePath] = true
-		ctx.WriteString(fmt.Sprintf("### Source: %s\n%s\n\n---\n\n", r.ArticlePath, string(data)))
+		ctx.WriteString(fmt.Sprintf("### Source: %s\n%s\n\n---\n\n", r.ArticlePath, content))
 		sources = append(sources, r.ArticlePath)
+		tokensUsed += contentTokens
 	}
 
+	// Graph-expanded articles
+	for _, ge := range graphExpanded {
+		if ge.ArticlePath == "" || seen[ge.ArticlePath] {
+			continue
+		}
+		absPath := filepath.Join(projectDir, ge.ArticlePath)
+		data, err := os.ReadFile(absPath)
+		if err != nil {
+			continue
+		}
+		content := string(data)
+		if len(content) > maxPerArticle {
+			content = content[:maxPerArticle]
+		}
+		contentTokens := len(content) / 4
+		if tokensUsed+contentTokens > tokenBudget {
+			break
+		}
+		seen[ge.ArticlePath] = true
+		ctx.WriteString(fmt.Sprintf("### Graph-related: %s\n%s\n\n---\n\n", ge.ArticlePath, content))
+		sources = append(sources, ge.ArticlePath)
+		tokensUsed += contentTokens
+	}
+
+	// Fallback: depth-1 ontology traversal
 	for _, r := range results {
 		if r.ID == "" {
 			continue
@@ -295,8 +395,17 @@ func buildDocLevelContext(projectDir string, question string, topK int,
 			if rel.ArticlePath != "" && !seen[rel.ArticlePath] {
 				absPath := filepath.Join(projectDir, rel.ArticlePath)
 				if data, err := os.ReadFile(absPath); err == nil {
+					content := string(data)
+					if len(content) > maxPerArticle {
+						content = content[:maxPerArticle]
+					}
+					contentTokens := len(content) / 4
+					if tokensUsed+contentTokens > tokenBudget {
+						break
+					}
 					seen[rel.ArticlePath] = true
-					ctx.WriteString(fmt.Sprintf("### Related: %s\n%s\n\n---\n\n", rel.ArticlePath, string(data)))
+					ctx.WriteString(fmt.Sprintf("### Related: %s\n%s\n\n---\n\n", rel.ArticlePath, content))
+					tokensUsed += contentTokens
 				}
 			}
 		}
@@ -540,6 +649,90 @@ func StreamQuery(ctx context.Context, projectDir string, question string, topK i
 	}
 
 	return sources, nil
+}
+
+// graphExpandedArticle represents an article discovered via graph expansion.
+type graphExpandedArticle struct {
+	EntityID    string
+	ArticlePath string
+	Score       float64
+}
+
+// computeGraphExpansion runs the graph relevance scorer and returns expanded articles.
+// Returns nil if no seeds, expansion disabled, or on error.
+func computeGraphExpansion(cfg *config.Config, ontStore *ontology.Store, seedIDs []string) []graphExpandedArticle {
+	if len(seedIDs) == 0 {
+		return nil
+	}
+
+	scored, err := graph.ScoreRelevance(ontStore, graph.RelevanceOpts{
+		SeedIDs:   seedIDs,
+		MaxExpand: cfg.Search.GraphMaxExpandOrDefault(),
+		MaxDepth:  cfg.Search.GraphDepthOrDefault(),
+		Weights: graph.RelevanceWeights{
+			DirectLink:     cfg.Search.WeightDirectLinkOrDefault(),
+			SourceOverlap:  cfg.Search.WeightSourceOverlapOrDefault(),
+			CommonNeighbor: cfg.Search.WeightCommonNeighborOrDefault(),
+			TypeAffinity:   cfg.Search.WeightTypeAffinityOrDefault(),
+		},
+	})
+	if err != nil {
+		log.Debug("graph expansion failed", "error", err)
+		return nil
+	}
+
+	var expanded []graphExpandedArticle
+	for _, s := range scored {
+		e, err := ontStore.GetEntity(s.EntityID)
+		if err != nil || e == nil || e.ArticlePath == "" {
+			continue
+		}
+		expanded = append(expanded, graphExpandedArticle{
+			EntityID:    s.EntityID,
+			ArticlePath: e.ArticlePath,
+			Score:       s.Score,
+		})
+	}
+	if len(expanded) > 0 {
+		log.Debug("graph expansion added articles", "count", len(expanded))
+	}
+	return expanded
+}
+
+// extractSeedIDsFromEnhanced extracts entity IDs from enhanced search results.
+func extractSeedIDsFromEnhanced(results []search.SearchResult) []string {
+	var ids []string
+	seen := map[string]bool{}
+	for _, r := range results {
+		id := r.DocID
+		if strings.HasPrefix(id, "concept:") {
+			id = id[8:]
+		} else if strings.HasPrefix(id, "summary:") {
+			continue
+		}
+		if !seen[id] {
+			ids = append(ids, id)
+			seen[id] = true
+		}
+	}
+	return ids
+}
+
+// extractSeedIDsFromDocLevel extracts entity IDs from hybrid search results.
+func extractSeedIDsFromDocLevel(results []hybrid.SearchResult) []string {
+	var ids []string
+	seen := map[string]bool{}
+	for _, r := range results {
+		id := r.ID
+		if strings.HasPrefix(id, "concept:") {
+			id = id[8:]
+		}
+		if id != "" && !seen[id] {
+			ids = append(ids, id)
+			seen[id] = true
+		}
+	}
+	return ids
 }
 
 func slugify(s string) string {
