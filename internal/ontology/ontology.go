@@ -191,13 +191,13 @@ func (s *Store) ListRelations(relationType string, limit int) ([]Relation, error
 	var err error
 	if relationType != "" {
 		rows, err = s.db.ReadDB().Query(
-			`SELECT id, source_id, target_id, relation, created_at
+			`SELECT COALESCE(id,''), source_id, target_id, relation, COALESCE(created_at,'')
 			 FROM relations WHERE relation=? ORDER BY created_at DESC LIMIT ?`,
 			relationType, limit,
 		)
 	} else {
 		rows, err = s.db.ReadDB().Query(
-			`SELECT id, source_id, target_id, relation, created_at
+			`SELECT COALESCE(id,''), source_id, target_id, relation, COALESCE(created_at,'')
 			 FROM relations ORDER BY created_at DESC LIMIT ?`,
 			limit,
 		)
