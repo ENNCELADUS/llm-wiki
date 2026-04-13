@@ -48,6 +48,11 @@ func Diff(projectDir string, cfg *config.Config, mf *manifest.Manifest) (*DiffRe
 				return nil
 			}
 
+			// Skip hidden files (.DS_Store etc.)
+			if strings.HasPrefix(d.Name(), ".") {
+				return nil
+			}
+
 			// Get relative path from project root
 			relPath, _ := filepath.Rel(projectDir, path)
 
@@ -67,10 +72,22 @@ func Diff(projectDir string, cfg *config.Config, mf *manifest.Manifest) (*DiffRe
 				return nil
 			}
 
+			var detectedType string
+			if len(cfg.TypeSignals) > 0 {
+				// Reuse cached type from manifest if file is unchanged
+				if existing, ok := mf.Sources[relPath]; ok && existing.Hash == hash && existing.Type != "" {
+					detectedType = existing.Type
+				} else {
+					contentHead := extract.ReadHead(path, extract.DefaultHeadRunes)
+					detectedType = extract.DetectSourceTypeWithSignals(path, contentHead, convertSignals(cfg.TypeSignals))
+				}
+			} else {
+				detectedType = extract.DetectSourceType(path)
+			}
 			current[relPath] = SourceInfo{
 				Path: relPath,
 				Hash: hash,
-				Type: extract.DetectSourceType(path),
+				Type: detectedType,
 				Size: info.Size(),
 			}
 			return nil
