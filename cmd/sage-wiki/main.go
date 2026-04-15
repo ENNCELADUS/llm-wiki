@@ -25,6 +25,7 @@ import (
 	tuidashboard "github.com/xoai/sage-wiki/internal/tui/dashboard"
 	"github.com/xoai/sage-wiki/internal/web"
 	"github.com/xoai/sage-wiki/internal/query"
+	"github.com/xoai/sage-wiki/internal/scribe"
 	"github.com/xoai/sage-wiki/internal/storage"
 	"github.com/xoai/sage-wiki/internal/vectors"
 	"github.com/xoai/sage-wiki/internal/wiki"
@@ -131,6 +132,14 @@ var provenanceCmd = &cobra.Command{
 	RunE:  runProvenance,
 }
 
+var scribeCmd = &cobra.Command{
+	Use:   "scribe <session-file>",
+	Short: "Extract knowledge entities from a session transcript",
+	Long:  "Process a Claude Code session JSONL file, extract entities, and add them to the wiki ontology.\n\nUsage: sage-wiki scribe path/to/session.jsonl",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runScribe,
+}
+
 func init() {
 	rootCmd.PersistentFlags().StringVar(&projectDir, "project", ".", "Project directory")
 	rootCmd.PersistentFlags().StringVar(&configPath, "config", "", "Config file path (default: <project>/config.yaml)")
@@ -172,7 +181,7 @@ func init() {
 	// Query flags
 	queryCmd.Flags().String("scope", "local", "Query scope: local, global, or all")
 
-	rootCmd.AddCommand(initCmd, compileCmd, serveCmd, lintCmd, searchCmd, queryCmd, statusCmd, ingestCmd, doctorCmd, tuiCmd, provenanceCmd, diffCmd, listCmd, ontologyCmd, writeCmd, learnCmd, captureCmd, addSourceCmd, sourceCmd, hubCmd)
+	rootCmd.AddCommand(initCmd, compileCmd, serveCmd, lintCmd, searchCmd, queryCmd, statusCmd, ingestCmd, doctorCmd, tuiCmd, provenanceCmd, scribeCmd, diffCmd, listCmd, ontologyCmd, writeCmd, learnCmd, captureCmd, addSourceCmd, sourceCmd, hubCmd)
 }
 
 // Placeholder implementations — will be filled in subsequent tasks
@@ -679,4 +688,68 @@ func runProvenance(cmd *cobra.Command, args []string) error {
 	}
 
 	return fmt.Errorf("provenance: %q not found in sources or concepts. Use a source path (e.g. raw/paper.pdf) or concept name (e.g. attention)", target)
+}
+
+func runScribe(cmd *cobra.Command, args []string) error {
+	dir, _ := filepath.Abs(projectDir)
+	filePath := args[0]
+
+	// Load config
+	cfgPath := filepath.Join(dir, "config.yaml")
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return fmt.Errorf("scribe: load config: %w", err)
+	}
+
+	// Read session file
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("scribe: read file: %w", err)
+	}
+
+	// Create LLM client
+	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit)
+	if err != nil {
+		return fmt.Errorf("scribe: create LLM client: %w", err)
+	}
+
+	// Open DB
+	dbPath := filepath.Join(dir, ".sage", "wiki.db")
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		return fmt.Errorf("scribe: open db: %w", err)
+	}
+	defer db.Close()
+
+	merged := ontology.MergedRelations(cfg.Ontology.Relations)
+	mergedTypes := ontology.MergedEntityTypes(cfg.Ontology.EntityTypes)
+	ontStore := ontology.NewStore(db, ontology.ValidRelationNames(merged), ontology.ValidEntityTypeNames(mergedTypes))
+
+	model := cfg.Models.Extract
+	if model == "" {
+		model = cfg.Models.Summarize
+	}
+
+	// Run session scribe with configured entity types
+	validTypes := ontology.ValidEntityTypeNames(mergedTypes)
+	s := scribe.NewSessionScribe(client, model, ontStore, validTypes...)
+	result, err := s.Process(cmd.Context(), data)
+	if err != nil {
+		return fmt.Errorf("scribe: %w", err)
+	}
+
+	// Report
+	fmt.Fprintf(os.Stderr, "Session scribe complete:\n")
+	fmt.Fprintf(os.Stderr, "  Input: %d bytes → %d bytes compressed\n", result.InputSize, result.CompressedTo)
+	fmt.Fprintf(os.Stderr, "  Extracted: %d candidates\n", result.Extracted)
+	fmt.Fprintf(os.Stderr, "  Kept: %d entities, %d skipped\n", result.Kept, result.Skipped)
+
+	for _, e := range result.Entities {
+		fmt.Printf("  + %s (%s): %s\n", e.Name, e.Type, e.Definition)
+	}
+	for _, r := range result.Relations {
+		fmt.Printf("  → %s -[%s]→ %s\n", r.SourceID, r.Relation, r.TargetID)
+	}
+
+	return nil
 }

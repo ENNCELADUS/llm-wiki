@@ -206,7 +206,31 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 		}
 	}
 
-	// Initialize checkpoint state
+	// Initialize compile_items store and tier manager
+	itemStore := NewCompileItemStore(db)
+	tierMgr := NewTierManager(&cfg.Compiler, itemStore)
+	bp := NewBackpressureController(cfg.Compiler.MaxParallel)
+
+	// Populate compile_items from manifest on first run (if empty)
+	if count, _ := itemStore.Count(); count == 0 && mf.SourceCount() > 0 {
+		populated, err := PopulateFromManifest(db, mf, cfg)
+		if err != nil {
+			log.Warn("populate compile_items from manifest failed", "error", err)
+		} else if populated > 0 {
+			log.Info("populated compile_items from manifest", "count", populated)
+		}
+	}
+
+	// Migrate legacy checkpoint if present
+	if !opts.Fresh {
+		if migrated, err := MigrateCheckpoint(projectDir, db, mf, cfg); err != nil {
+			log.Warn("checkpoint migration failed", "error", err)
+		} else if migrated {
+			log.Info("legacy checkpoint migrated to compile_items")
+		}
+	}
+
+	// Initialize legacy checkpoint state (retained for fallback)
 	if state == nil {
 		state = &CompileState{
 			CompileID: time.Now().Format("20060102-150405"),
@@ -215,8 +239,55 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 		}
 	}
 
-	// Merge new files from diff into checkpoint pending list
-	// This handles files added while the watcher was stopped
+	// Resolve tiers and upsert compile_items for new/modified sources
+	allSources := append(diff.Added, diff.Modified...)
+	compileID := state.CompileID
+	for _, src := range allSources {
+		tier := tierMgr.ResolveTier(src.Path, projectDir, nil)
+		itemStore.Upsert(CompileItem{
+			SourcePath:  src.Path,
+			Hash:        src.Hash,
+			FileType:    src.Type,
+			SizeBytes:   src.Size,
+			Tier:        tier,
+			TierDefault: tierMgr.ConfigDefault(src.Path),
+			SourceType:  "compiler",
+			CompileID:   compileID,
+		})
+	}
+
+	// Tier 0: FTS5 index only (no LLM, ~5ms/doc)
+	tier0Pending, _ := itemStore.ListPending(0)
+	if len(tier0Pending) > 0 {
+		progress.StartPhase("Tier 0: Index sources", len(tier0Pending))
+		indexed := indexRawSources(projectDir, tier0Pending, memStore, itemStore)
+		log.Info("tier 0 indexing complete", "indexed", indexed)
+		progress.EndPhase()
+	}
+
+	// Tier 1: FTS5 + vector embed (~200ms/doc)
+	tier1Pending, _ := itemStore.ListPending(1)
+	if len(tier1Pending) > 0 {
+		progress.StartPhase("Tier 1: Index + embed sources", len(tier1Pending))
+		indexed, embedded := indexAndEmbedSources(projectDir, tier1Pending, memStore, vecStore, embedder, itemStore, bp)
+		log.Info("tier 1 indexing complete", "indexed", indexed, "embedded", embedded)
+		progress.EndPhase()
+	}
+
+	// Tier 3: Full LLM pipeline (Pass 1 → 2 → 3) — only for Tier 3 sources
+	tier3Pending, _ := itemStore.ListPending(3)
+	var toProcess []SourceInfo
+	tier3Set := make(map[string]bool)
+	for _, item := range tier3Pending {
+		tier3Set[item.SourcePath] = true
+	}
+	for _, s := range allSources {
+		if tier3Set[s.Path] {
+			toProcess = append(toProcess, s)
+		}
+	}
+
+	// Also include sources from legacy checkpoint pending list
 	completedSet := make(map[string]bool)
 	for _, p := range state.Completed {
 		completedSet[p] = true
@@ -225,194 +296,84 @@ func Compile(projectDir string, opts CompileOpts) (*CompileResult, error) {
 	for _, p := range state.Pending {
 		pendingSet[p] = true
 	}
-	for _, s := range append(diff.Added, diff.Modified...) {
-		if !completedSet[s.Path] && !pendingSet[s.Path] {
-			state.Pending = append(state.Pending, s.Path)
-			pendingSet[s.Path] = true
-			log.Info("new source added to compile queue", "path", s.Path)
-		}
-	}
-
-	// If new files were added, reset pass to 1 so they get summarized
-	newFiles := false
-	var toProcess []SourceInfo
-	for _, s := range append(diff.Added, diff.Modified...) {
-		if pendingSet[s.Path] {
-			toProcess = append(toProcess, s)
-			if !completedSet[s.Path] {
-				newFiles = true
-			}
-		}
-	}
-	if newFiles && state.Pass > 1 {
-		log.Info("new sources detected, resetting to Pass 1")
-		state.Pass = 1
-	}
-	client.SetPass("summarize")
-	// Setup prompt cache for summarize pass (respects --no-cache and config)
-	cacheEnabled := cfg.Compiler.PromptCacheEnabled() && !opts.NoCache
-	var sumCacheID string
-	if cacheEnabled {
-		sumCacheID, _ = client.SetupCache("You are a research assistant creating structured summaries for a personal knowledge wiki.", cfg.Models.Summarize)
-	}
-	progress.StartPhase("Pass 1: Summarize sources", len(toProcess))
-
-	model := cfg.Models.Summarize
-	if model == "" {
-		model = "gpt-4o-mini"
-	}
-	maxTokens := cfg.Compiler.SummaryMaxTokens
-	if maxTokens <= 0 {
-		maxTokens = 2000
-	}
-
-	summaries := Summarize(projectDir, cfg.Output, toProcess, client, model, maxTokens, cfg.Compiler.MaxParallel, cfg.Compiler.UserTimeLocation(), cfg.Language)
-
-	for _, sr := range summaries {
-		if sr.Error != nil {
-			result.Errors++
-			progress.ItemError(sr.SourcePath, sr.Error)
-			state.Failed = append(state.Failed, FailedSource{
-				Path:  sr.SourcePath,
-				Error: sr.Error.Error(),
-			})
-			continue
-		}
-
-		result.Summarized++
-		progress.ItemDone(sr.SourcePath, sr.SummaryPath)
-
-		// Update manifest — register or update source hash
-		for _, s := range toProcess {
-			if s.Path == sr.SourcePath {
-				if _, exists := mf.Sources[sr.SourcePath]; !exists {
-					// New source
-					mf.AddSource(s.Path, s.Hash, s.Type, s.Size)
-				} else {
-					// Existing source — update hash so it's not flagged as modified next time
-					src := mf.Sources[sr.SourcePath]
-					src.Hash = s.Hash
-					mf.Sources[sr.SourcePath] = src
+	for _, s := range allSources {
+		if !completedSet[s.Path] && !pendingSet[s.Path] && !tier3Set[s.Path] {
+			// Check if this source should be in the legacy pending list
+			item, _ := itemStore.GetByPath(s.Path)
+			if item != nil && item.Tier >= 3 && !item.PassWritten {
+				state.Pending = append(state.Pending, s.Path)
+				if !tier3Set[s.Path] {
+					toProcess = append(toProcess, s)
+					tier3Set[s.Path] = true
 				}
-				break
 			}
 		}
-		mf.MarkCompiled(sr.SourcePath, sr.SummaryPath, sr.Concepts)
+	}
 
-		// Index in FTS5
-		memStore.Add(memory.Entry{
-			ID:          sr.SourcePath,
-			Content:     sr.Summary,
-			Tags:        []string{extractType(sr.SourcePath, cfg.TypeSignals)},
-			ArticlePath: sr.SummaryPath,
+	if len(toProcess) > 0 {
+		cacheEnabled := cfg.Compiler.PromptCacheEnabled() && !opts.NoCache
+		pipelineResult := runFullPipeline(toProcess, FullPipelineOpts{
+			ProjectDir:   projectDir,
+			Config:       cfg,
+			Client:       client,
+			Manifest:     mf,
+			DB:           db,
+			MemStore:     memStore,
+			VecStore:     vecStore,
+			ChunkStore:   chunkStore,
+			OntStore:     pipelineOntStore,
+			Embedder:     embedder,
+			Backpressure: bp,
+			ItemStore:    itemStore,
+			CacheEnabled: cacheEnabled,
+			Progress:     progress,
+			State:        state,
+			StatePath:    statePath,
 		})
+		result.Summarized = pipelineResult.Summarized
+		result.ConceptsExtracted = pipelineResult.ConceptsExtracted
+		result.ArticlesWritten = pipelineResult.ArticlesWritten
+		result.Errors += pipelineResult.Errors
+		result.EmbedErrors = pipelineResult.EmbedErrors
 
-		// Generate embedding
-		if embedder != nil {
-			vec, err := embedder.Embed(sr.Summary)
-			if err != nil {
-				log.Warn("embedding failed", "source", sr.SourcePath, "error", err)
-				result.EmbedErrors++
-			} else {
-				vecStore.Upsert(sr.SourcePath, vec)
+		// Mark Tier 3 passes only for sources that succeeded
+		succeeded := make(map[string]bool)
+		for _, p := range pipelineResult.SucceededSources {
+			succeeded[p] = true
+		}
+		for _, s := range toProcess {
+			if succeeded[s.Path] {
+				if err := itemStore.MarkPass(s.Path, "summarized"); err != nil {
+					log.Warn("mark pass failed", "path", s.Path, "pass", "summarized", "error", err)
+				}
+				if err := itemStore.MarkPass(s.Path, "extracted"); err != nil {
+					log.Warn("mark pass failed", "path", s.Path, "pass", "extracted", "error", err)
+				}
+				if err := itemStore.MarkPass(s.Path, "written"); err != nil {
+					log.Warn("mark pass failed", "path", s.Path, "pass", "written", "error", err)
+				}
 			}
 		}
-
-		// Update checkpoint
-		removeFromPending(state, sr.SourcePath)
-		state.Completed = append(state.Completed, sr.SourcePath)
-		saveCompileState(statePath, state)
 	}
 
-	// Update checkpoint pass
-	client.TeardownCache(sumCacheID)
-	state.Pass = 2
-	saveCompileState(statePath, state)
-
-	// Pass 2: Concept extraction
-	successfulSummaries := filterSuccessful(summaries)
-	if len(successfulSummaries) > 0 {
-		extractModel := cfg.Models.Extract
-		if extractModel == "" {
-			extractModel = model
-		}
-
-		client.SetPass("extract")
-		var extCacheID string
-		if cacheEnabled {
-			extCacheID, _ = client.SetupCache("You are an expert knowledge organizer. Extract structured concepts from source summaries.", extractModel)
-		}
-		progress.StartPhase("Pass 2: Extract concepts", len(successfulSummaries))
-		concepts, err := ExtractConcepts(successfulSummaries, mf.Concepts, client, extractModel)
-		if err != nil {
-			progress.ItemError("concept extraction", err)
-			result.Errors++
-		} else {
-			result.ConceptsExtracted = len(concepts)
-
-			// Report discovered concepts
-			var conceptNames []string
-			for _, c := range concepts {
-				conceptNames = append(conceptNames, c.Name)
-				mf.AddConcept(c.Name, filepath.Join(cfg.Output, "concepts", c.Name+".md"), c.Sources)
+	// Check promotions/demotions
+	if cfg.Compiler.AutoPromoteEnabled() {
+		if promoted, err := tierMgr.CheckPromotions(); err == nil && len(promoted) > 0 {
+			log.Info("sources eligible for promotion", "count", len(promoted))
+			for _, p := range promoted {
+				if err := itemStore.SetTier(p, 3, "auto-promote"); err != nil {
+					log.Warn("set tier failed", "path", p, "tier", 3, "error", err)
+				}
 			}
-			progress.ConceptsDiscovered(conceptNames)
-			progress.EndPhase()
-			client.TeardownCache(extCacheID)
-
-			// Pass 3: Write articles
-			if len(concepts) > 0 {
-				writeModel := cfg.Models.Write
-				if writeModel == "" {
-					writeModel = model
+		}
+	}
+	if cfg.Compiler.AutoDemoteEnabled() {
+		if demoted, err := tierMgr.CheckDemotions(); err == nil && len(demoted) > 0 {
+			log.Info("demoting stale sources", "count", len(demoted))
+			for _, p := range demoted {
+				if err := itemStore.SetTier(p, 1, "stale"); err != nil {
+					log.Warn("set tier failed", "path", p, "tier", 1, "error", err)
 				}
-				articleMaxTokens := cfg.Compiler.ArticleMaxTokens
-				if articleMaxTokens <= 0 {
-					articleMaxTokens = 4000
-				}
-
-				merged := ontology.MergedRelations(cfg.Ontology.Relations)
-				mergedTypes := ontology.MergedEntityTypes(cfg.Ontology.EntityTypes)
-				ontStore := ontology.NewStore(db, ontology.ValidRelationNames(merged), ontology.ValidEntityTypeNames(mergedTypes))
-
-				client.SetPass("write")
-				var writeCacheID string
-				if cacheEnabled {
-					writeCacheID, _ = client.SetupCache("You are a knowledge base article writer. Write comprehensive, well-structured wiki articles.", writeModel)
-				}
-				relPatterns := ontology.RelationPatterns(merged)
-				progress.StartPhase("Pass 3: Write articles", len(concepts))
-				articles := WriteArticles(ArticleWriteOpts{
-					ProjectDir:       projectDir,
-					OutputDir:        cfg.Output,
-					Client:           client,
-					Model:            writeModel,
-					MaxTokens:        articleMaxTokens,
-					MaxParallel:      cfg.Compiler.MaxParallel,
-					MemStore:         memStore,
-					VecStore:         vecStore,
-					OntStore:         ontStore,
-					ChunkStore:       chunkStore,
-					DB:               db,
-					Embedder:         embedder,
-					UserTZ:           cfg.Compiler.UserTimeLocation(),
-					ArticleFields:    cfg.Compiler.ArticleFields,
-					RelationPatterns: relPatterns,
-					ChunkSize:        cfg.Search.ChunkSizeOrDefault(),
-					Language:         cfg.Language,
-				}, concepts)
-
-				for _, ar := range articles {
-					if ar.Error != nil {
-						result.Errors++
-						progress.ItemError(ar.ConceptName, ar.Error)
-					} else {
-						result.ArticlesWritten++
-						progress.ItemDone(ar.ConceptName, ar.ArticlePath)
-					}
-				}
-				progress.EndPhase()
-				client.TeardownCache(writeCacheID)
 			}
 		}
 	}

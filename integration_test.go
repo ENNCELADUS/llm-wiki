@@ -90,14 +90,16 @@ Self-attention computes contextual representations.
 			"limit": float64(5),
 		})
 
-		var results []map[string]any
-		json.Unmarshal([]byte(result), &results)
-		if len(results) == 0 {
+		var resp struct {
+			Results []map[string]any `json:"results"`
+		}
+		json.Unmarshal([]byte(result), &resp)
+		if len(resp.Results) == 0 {
 			t.Fatal("expected search results")
 		}
 		// flash-attention should rank high (matches both terms)
 		found := false
-		for _, r := range results {
+		for _, r := range resp.Results {
 			if r["ID"] == "flash-attention" {
 				found = true
 				break
@@ -115,13 +117,15 @@ Self-attention computes contextual representations.
 			"tags":  "optimization",
 		})
 
-		var results []map[string]any
-		json.Unmarshal([]byte(result), &results)
-		if len(results) != 1 {
-			t.Fatalf("expected 1 result with optimization tag, got %d", len(results))
+		var resp struct {
+			Results []map[string]any `json:"results"`
 		}
-		if results[0]["ID"] != "flash-attention" {
-			t.Errorf("expected flash-attention, got %s", results[0]["ID"])
+		json.Unmarshal([]byte(result), &resp)
+		if len(resp.Results) != 1 {
+			t.Fatalf("expected 1 result with optimization tag, got %d", len(resp.Results))
+		}
+		if resp.Results[0]["ID"] != "flash-attention" {
+			t.Errorf("expected flash-attention, got %s", resp.Results[0]["ID"])
 		}
 	})
 

@@ -3,6 +3,7 @@ package llm
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -95,6 +96,7 @@ func (c *Client) ChatCompletion(messages []Message, opts CallOpts) (*Response, e
 // Used by ChatCompletion and as the fallback path for ChatCompletionCached.
 func (c *Client) chatCompletionDirect(messages []Message, opts CallOpts) (*Response, error) {
 	var lastErr error
+	var lastStatusCode int
 
 	for attempt := 0; attempt < 4; attempt++ {
 		// Wait for rate limiter
@@ -126,11 +128,21 @@ func (c *Client) chatCompletionDirect(messages []Message, opts CallOpts) (*Respo
 			delay := backoffDelay(attempt)
 			log.Warn("retryable error, retrying", "status", resp.StatusCode, "attempt", attempt+1, "delay", delay)
 			time.Sleep(delay)
+			lastStatusCode = resp.StatusCode
 			lastErr = fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
 			continue
 		}
 
 		return nil, fmt.Errorf("llm: API returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	// If the final failure was a 429, return a typed RateLimitError
+	// so BackpressureController can detect it and adjust concurrency.
+	if lastStatusCode == 429 {
+		return nil, &RateLimitError{
+			StatusCode: 429,
+			Body:       lastErr.Error(),
+		}
 	}
 
 	return nil, fmt.Errorf("llm: max retries exceeded: %w", lastErr)
@@ -213,6 +225,25 @@ func defaultRateLimit(provider string) int {
 	default:
 		return 30
 	}
+}
+
+// RateLimitError is returned when the LLM API returns 429 (Too Many Requests)
+// after exhausting all retries. The BackpressureController uses this to
+// distinguish rate limits from other errors and adjust concurrency.
+type RateLimitError struct {
+	StatusCode int
+	Body       string
+	RetryAfter time.Duration // from Retry-After header, if present
+}
+
+func (e *RateLimitError) Error() string {
+	return fmt.Sprintf("llm: rate limited (HTTP %d): %s", e.StatusCode, e.Body)
+}
+
+// IsRateLimitError checks whether an error is a rate limit error.
+func IsRateLimitError(err error) bool {
+	var rle *RateLimitError
+	return errors.As(err, &rle)
 }
 
 // isRetryable returns true for HTTP status codes that warrant automatic retry.

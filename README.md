@@ -9,9 +9,11 @@ Some lessons learned after building sage-wiki [here](https://x.com/xoai/status/2
 Drop in your papers, articles, and notes. sage-wiki compiles them into a structured, interlinked wiki — with concepts extracted, cross-references discovered, and everything searchable.
 
 - **Your sources in, a wiki out.** Add documents to a folder. The LLM reads, summarizes, extracts concepts, and writes interconnected articles.
+- **Scales to 100K+ documents.** Tiered compilation indexes everything fast, compiles only what matters. A 100K vault is searchable in hours, not months.
 - **Compounding knowledge.** Every new source enriches existing articles. The wiki gets smarter as it grows.
 - **Works with your tools.** Opens natively in Obsidian. Connects to any LLM agent via MCP. Runs as a single binary — nothing to install beyond the API key.
 - **Ask your wiki questions.** Enhanced search with chunk-level indexing, LLM query expansion, and re-ranking. Ask natural language questions and get cited answers.
+- **Compile on demand.** Agents can trigger compilation for specific topics via MCP. Search results signal when uncompiled sources are available.
 
 https://github.com/user-attachments/assets/c35ee202-e9df-4ccd-b520-8f057163ff26
 
@@ -132,6 +134,7 @@ See the [self-hosting guide](docs/guides/self-hosted-server.md) for Docker Compo
 | `sage-wiki learn "text"`                                                                | Store a learning entry                           |
 | `sage-wiki capture "text"`                                                              | Capture knowledge from text                      |
 | `sage-wiki add-source <path>`                                                           | Register a source file in the manifest           |
+| `sage-wiki scribe <session-file>`                                                       | Extract entities from a session transcript       |
 
 ## TUI
 
@@ -226,13 +229,13 @@ embed:
   # base_url:                   # separate endpoint
 
 compiler:
-  max_parallel: 4 # concurrent LLM calls
+  max_parallel: 20 # concurrent LLM calls (with adaptive backpressure)
   debounce_seconds: 2 # watch mode debounce
   summary_max_tokens: 2000
   article_max_tokens: 4000
   auto_commit: true # git commit after compile
   auto_lint: true # run lint after compile
-  # mode: standard            # standard, batch, or auto
+  mode: auto # standard, batch, or auto (auto = batch when 10+ sources)
   # estimate_before: false    # prompt with cost estimate before compiling
   # prompt_cache: true        # enable prompt caching (default: true)
   # batch_threshold: 10       # min sources for auto-batch mode
@@ -241,6 +244,20 @@ compiler:
   # article_fields:           # custom frontmatter fields extracted from LLM response
   #   - language
   #   - domain
+
+  # Tiered compilation — index fast, compile what matters
+  default_tier: 1 # 0=index, 1=index+embed, 3=full compile
+  # tier_defaults:             # per-extension tier overrides
+  #   json: 0                  # structured data — index only
+  #   yaml: 0
+  #   lock: 0
+  #   md: 1                    # prose — index + embed
+  #   go: 1                    # code — index + embed + parse
+  # auto_promote: true         # promote to tier 3 based on query hits
+  # auto_demote: true          # demote stale articles
+  # split_threshold: 15000     # chars — split large docs for faster writing
+  # dedup_threshold: 0.85      # cosine similarity for concept dedup
+  # backpressure: true         # adaptive concurrency on rate limits
 
 search:
   hybrid_weight_bm25: 0.7 # BM25 vs vector weight
@@ -309,6 +326,30 @@ sage-wiki compile --estimate    # show cost breakdown, exit
 Or set `compiler.estimate_before: true` in config to prompt every time.
 
 **Auto mode** — Set `compiler.mode: auto` and `compiler.batch_threshold: 10` to automatically use batch when compiling 10+ sources.
+
+## Scaling to Large Vaults
+
+sage-wiki uses **tiered compilation** to handle vaults of 10K-100K+ documents. Instead of compiling everything through the full LLM pipeline, sources are routed through tiers based on file type and usage:
+
+| Tier | What happens | Cost | Time per doc |
+|------|-------------|------|-------------|
+| **0** — Index only | FTS5 full-text search | Free | ~5ms |
+| **1** — Index + embed | FTS5 + vector embedding | ~$0.00002 | ~200ms |
+| **2** — Code parse | Structural summary via regex parser (no LLM) | Free | ~10ms |
+| **3** — Full compile | Summarize + extract concepts + write articles | ~$0.05-0.15 | ~5-8 min |
+
+At `default_tier: 1`, a 100K vault is searchable in ~5.5 hours. Articles compile lazily — when an agent queries a topic, search signals uncompiled sources, and `wiki_compile_topic` compiles just that cluster (~2 min for 20 sources).
+
+**Key features:**
+- **File-type defaults** — JSON, YAML, and lock files skip to Tier 0 automatically. Configure per-extension via `tier_defaults`.
+- **Auto-promotion** — Sources promote to Tier 3 after 3+ search hits or when a topic cluster reaches 5+ sources.
+- **Auto-demotion** — Stale articles (90 days without queries) demote to Tier 1 for recompilation on next access.
+- **Adaptive backpressure** — Concurrency self-tunes to your provider's rate limits. Starts at 20 parallel, halves on 429s, recovers automatically.
+- **10 code parsers** — Go (via go/ast), TypeScript, JavaScript, Python, Rust, Java, C, C++, Ruby, plus JSON/YAML/TOML key extraction. Code gets structural summaries without LLM calls.
+- **Compile-on-demand** — `wiki_compile_topic("flash attention")` via MCP compiles relevant sources in real time.
+- **Quality scoring** — Per-article source coverage, extraction completeness, and cross-reference density tracked automatically.
+
+See the [full scaling guide](docs/guides/large-vault-performance.md) for configuration, tier override examples, and performance targets.
 
 ## Search Quality
 
@@ -499,13 +540,14 @@ python3 eval.py ./test-fixture
 
 ![Sage-Wiki Architecture](sage-wiki-architecture.png)
 
-- **Storage:** SQLite with FTS5 (BM25 search) + BLOB vectors (cosine similarity)
+- **Storage:** SQLite with FTS5 (BM25 search) + BLOB vectors (cosine similarity) + compile_items table for per-source tier/state tracking
 - **Ontology:** Typed entity-relation graph with BFS traversal and cycle detection
-- **Search:** Enhanced pipeline with chunk-level FTS5 + vector indexing, LLM query expansion, LLM re-ranking, RRF fusion, and 4-signal graph expansion. Falls back to document-level BM25 + vector + tag boost + recency decay
-- **Compiler:** 5-pass pipeline (diff, summarize, extract concepts, write articles, images) with prompt caching, batch API, cost tracking, and cascade awareness for source removal
-- **MCP:** 16 tools (6 read, 8 write, 2 compound) via stdio or SSE, including `wiki_capture` for knowledge extraction and `wiki_provenance` for source↔article mappings
-- **TUI:** bubbletea + glamour 4-tab terminal dashboard (browse, search, Q&A, compile)
+- **Search:** Enhanced pipeline with chunk-level FTS5 + vector indexing, LLM query expansion, LLM re-ranking, RRF fusion, and 4-signal graph expansion. Search responses signal uncompiled sources for compile-on-demand.
+- **Compiler:** Tiered pipeline (Tier 0: index, Tier 1: embed, Tier 2: code parse, Tier 3: full LLM compile) with adaptive backpressure, prompt caching, batch API, cost tracking, compile-on-demand via MCP, quality scoring, and cascade awareness. 10 built-in code parsers (Go via go/ast, 8 languages via regex, structured data key extraction).
+- **MCP:** 17 tools (6 read, 9 write, 2 compound) via stdio or SSE, including `wiki_compile_topic` for on-demand compilation and `wiki_capture` for knowledge extraction
+- **TUI:** bubbletea + glamour 4-tab terminal dashboard (browse, search, Q&A, compile) with tier distribution display
 - **Web UI:** Preact + Tailwind CSS embedded via `go:embed` with build tag (`-tags webui`)
+- **Scribe:** Extensible interface for ingesting knowledge from conversations. Session scribe processes Claude Code JSONL transcripts.
 
 Zero CGO. Pure Go. Cross-platform.
 

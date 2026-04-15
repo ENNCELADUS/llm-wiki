@@ -9,9 +9,11 @@
 将你的论文、文章和笔记放入文件夹,sage-wiki 会将它们编译为结构化、互相链接的 wiki -- 自动提取概念、发现交叉引用,并支持全文搜索。
 
 - **输入源文件,输出 wiki。** 将文档放入文件夹。LLM 会阅读、摘要、提取概念,并生成互相关联的文章。
+- **支持 10 万+文档扩展。** 分层编译快速索引一切,仅编译重要内容。10 万文档库在数小时内即可搜索,而非数月。
 - **知识持续积累。** 每一个新源文件都会丰富已有文章。wiki 会随着内容增长变得越来越智能。
 - **与你的工具无缝集成。** 原生支持 Obsidian 打开。通过 MCP 连接任意 LLM Agent。单一二进制文件 -- 除了 API Key 无需额外安装。
 - **向你的 wiki 提问。** 增强搜索支持 chunk 级别索引、LLM 查询扩展和重排序。用自然语言提问,获取带引用的回答。
+- **按需编译。** Agent 可通过 MCP 触发特定主题的编译。搜索结果会提示何时有未编译的源文件可用。
 
 https://github.com/user-attachments/assets/c35ee202-e9df-4ccd-b520-8f057163ff26
 
@@ -124,6 +126,15 @@ docker run -d -p 3333:3333 -v ./my-wiki:/wiki -e GEMINI_API_KEY=... sage-wiki
 | `sage-wiki status`                                                                      | 查看 wiki 统计和健康状态              |
 | `sage-wiki provenance <source-or-concept>`                                              | 查看源文件与文章的溯源映射            |
 | `sage-wiki doctor`                                                                      | 验证配置和连接性                      |
+| `sage-wiki diff`                                                                        | 显示待处理的源文件变更                |
+| `sage-wiki list`                                                                        | 列出实体、概念或源文件                |
+| `sage-wiki write <summary\|article>`                                                    | 写入摘要或文章                        |
+| `sage-wiki ontology <query\|list\|add>`                                                 | 查询、列出和管理本体图                |
+| `sage-wiki hub <add\|remove\|search\|status\|list>`                                    | 多项目 hub 命令                       |
+| `sage-wiki learn "text"`                                                                | 存储学习条目                          |
+| `sage-wiki capture "text"`                                                              | 从文本中捕获知识                      |
+| `sage-wiki add-source <path>`                                                           | 在 manifest 中注册源文件              |
+| `sage-wiki scribe <session-file>`                                                       | 从会话记录中提取实体                  |
 
 ## TUI
 
@@ -218,13 +229,13 @@ embed:
   # base_url:                   # 单独的端点
 
 compiler:
-  max_parallel: 4 # 并发 LLM 调用数
+  max_parallel: 20 # 并发 LLM 调用数 (自适应背压控制)
   debounce_seconds: 2 # watch 模式防抖
   summary_max_tokens: 2000
   article_max_tokens: 4000
   auto_commit: true # 编译后自动 git commit
   auto_lint: true # 编译后自动 lint
-  # mode: standard            # standard, batch 或 auto
+  mode: auto # standard, batch 或 auto (auto = 10+ 源文件时自动 batch)
   # estimate_before: false    # 编译前显示费用估算
   # prompt_cache: true        # 启用 prompt 缓存 (默认: true)
   # batch_threshold: 10       # auto-batch 模式的最小源文件数
@@ -233,6 +244,20 @@ compiler:
   # article_fields:           # 从 LLM 响应中提取的自定义 frontmatter 字段
   #   - language
   #   - domain
+
+  # 分层编译 -- 快速索引,按需编译
+  default_tier: 1 # 0=索引, 1=索引+向量, 3=完整编译
+  # tier_defaults:             # 按扩展名设置层级
+  #   json: 0                  # 结构化数据 -- 仅索引
+  #   yaml: 0
+  #   lock: 0
+  #   md: 1                    # 文本 -- 索引 + 向量
+  #   go: 1                    # 代码 -- 索引 + 向量 + 解析
+  # auto_promote: true         # 根据查询命中自动提升到层级 3
+  # auto_demote: true          # 自动降级过期文章
+  # split_threshold: 15000     # 字符数 -- 大文档拆分加速写作
+  # dedup_threshold: 0.85      # 概念去重的余弦相似度阈值
+  # backpressure: true         # 速率限制时自适应并发调节
 
 search:
   hybrid_weight_bm25: 0.7 # BM25 与向量搜索的权重
@@ -301,6 +326,30 @@ sage-wiki compile --estimate    # 显示费用明细后退出
 或在配置中设置 `compiler.estimate_before: true` 以每次编译前提示。
 
 **自动模式** -- 设置 `compiler.mode: auto` 和 `compiler.batch_threshold: 10`,编译 10 个以上源文件时自动使用 batch 模式。
+
+## 大规模知识库扩展
+
+sage-wiki 使用**分层编译**来处理 1 万至 10 万+文档的知识库。不再将每个源文件都通过完整的 LLM 管线,而是根据文件类型和使用情况将源文件路由到不同层级:
+
+| 层级 | 处理内容 | 费用 | 每文档耗时 |
+|------|---------|------|-----------|
+| **0** — 仅索引 | FTS5 全文搜索 | 免费 | ~5ms |
+| **1** — 索引 + 向量 | FTS5 + 向量 embedding | ~$0.00002 | ~200ms |
+| **2** — 代码解析 | 正则解析器提取结构摘要 (无 LLM) | 免费 | ~10ms |
+| **3** — 完整编译 | 摘要 + 提取概念 + 写作文章 | ~$0.05-0.15 | ~5-8 分钟 |
+
+在 `default_tier: 1` 设置下,10 万文档库在约 5.5 小时内即可搜索。文章按需编译 -- 当 Agent 查询某个主题时,搜索结果会提示未编译的源文件,`wiki_compile_topic` 仅编译该主题集群 (约 20 个源文件 ~2 分钟)。
+
+**核心特性:**
+- **文件类型默认层级** -- JSON、YAML 和 lock 文件自动跳到层级 0。可通过 `tier_defaults` 按扩展名配置。
+- **自动提升** -- 源文件在 3 次以上搜索命中或主题集群达到 5+ 源文件时自动提升到层级 3。
+- **自动降级** -- 过期文章 (90 天无查询) 降级到层级 1,下次访问时重新编译。
+- **自适应背压** -- 并发度自动适应提供商的速率限制。起始 20 并发,遇到 429 减半,自动恢复。
+- **10 个代码解析器** -- Go (go/ast)、TypeScript、JavaScript、Python、Rust、Java、C、C++、Ruby,以及 JSON/YAML/TOML 键提取。代码无需 LLM 调用即可获得结构摘要。
+- **按需编译** -- 通过 MCP 调用 `wiki_compile_topic("flash attention")` 实时编译相关源文件。
+- **质量评分** -- 自动追踪每篇文章的源覆盖率、提取完整度和交叉引用密度。
+
+参阅[完整扩展指南](docs/guides/large-vault-performance.md)了解配置、层级覆盖示例和性能目标。
 
 ## 搜索质量
 
@@ -491,13 +540,14 @@ python3 eval.py ./test-fixture
 
 ![Sage-Wiki Architecture](sage-wiki-architecture.png)
 
-- **存储:** SQLite + FTS5 (BM25 搜索) + BLOB 向量 (余弦相似度)
+- **存储:** SQLite + FTS5 (BM25 搜索) + BLOB 向量 (余弦相似度) + compile_items 表用于每源文件层级/状态追踪
 - **本体:** 类型化实体-关系图,支持 BFS 遍历和环检测
-- **搜索:** 增强管线,支持 chunk 级别 FTS5 + 向量索引、LLM 查询扩展、LLM 重排序、RRF 融合和 4 信号图扩展。回退为文档级别 BM25 + 向量 + 标签加成 + 时间衰减
-- **编译器:** 5 阶段管线 (diff、摘要、提取概念、写作文章、图片),支持 prompt 缓存、batch API、费用追踪和源文件删除级联感知
-- **MCP:** 16 个工具 (6 读、8 写、2 组合),通过 stdio 或 SSE 提供,包括 `wiki_capture` 知识提取和 `wiki_provenance` 源文件-文章映射
-- **TUI:** bubbletea + glamour 4 标签终端面板 (浏览、搜索、问答、编译)
+- **搜索:** 增强管线,支持 chunk 级别 FTS5 + 向量索引、LLM 查询扩展、LLM 重排序、RRF 融合和 4 信号图扩展。搜索结果提示未编译源文件以支持按需编译。
+- **编译器:** 分层管线 (层级 0: 索引, 层级 1: 向量, 层级 2: 代码解析, 层级 3: 完整 LLM 编译),支持自适应背压、prompt 缓存、batch API、费用追踪、MCP 按需编译、质量评分和级联感知。内置 10 个代码解析器 (Go 使用 go/ast, 8 种语言使用正则, 结构化数据键提取)。
+- **MCP:** 17 个工具 (6 读、9 写、2 组合),通过 stdio 或 SSE 提供,包括 `wiki_compile_topic` 按需编译和 `wiki_capture` 知识提取
+- **TUI:** bubbletea + glamour 4 标签终端面板 (浏览、搜索、问答、编译),支持层级分布显示
 - **Web UI:** Preact + Tailwind CSS 通过 `go:embed` 嵌入,使用构建标签 (`-tags webui`)
+- **Scribe:** 可扩展接口,从对话中摄取知识。会话 scribe 处理 Claude Code JSONL 记录。
 
 零 CGO。纯 Go。跨平台。
 

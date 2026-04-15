@@ -68,6 +68,7 @@ func NewRunner() *Runner {
 			&ConnectionsPass{},
 			&ImputePass{},
 			&StalenessPass{},
+			&QualityPass{},
 		},
 	}
 }

@@ -48,37 +48,59 @@ type ArticleWriteOpts struct {
 	ArticleFields    []string
 	RelationPatterns []ontology.RelationPattern
 	ChunkSize        int // tokens per chunk (default 800)
+	SplitThreshold   int // chars — enable section-aware writing above this (default 15000)
 	Language         string
+	Backpressure     *BackpressureController // optional; if nil, uses fixed semaphore
 }
 
 // WriteArticles runs Pass 3: write concept articles with ontology edges.
 func WriteArticles(opts ArticleWriteOpts, concepts []ExtractedConcept) []ArticleResult {
 	maxParallel := opts.MaxParallel
 	if maxParallel <= 0 {
-		maxParallel = 4
+		maxParallel = 20
 	}
 
 	results := make([]ArticleResult, len(concepts))
-	sem := make(chan struct{}, maxParallel)
 	var wg sync.WaitGroup
 	var done atomic.Int32
 	total := len(concepts)
 
+	// Use BackpressureController if available, otherwise fixed semaphore
+	var sem chan struct{}
+	if opts.Backpressure == nil {
+		sem = make(chan struct{}, maxParallel)
+	}
+
 	for i, concept := range concepts {
 		wg.Add(1)
-		sem <- struct{}{}
+
+		var release func()
+		if opts.Backpressure != nil {
+			release = opts.Backpressure.Acquire()
+		} else {
+			sem <- struct{}{}
+			release = func() { <-sem }
+		}
 
 		go func(idx int, c ExtractedConcept) {
 			defer wg.Done()
-			defer func() { <-sem }()
+			defer release()
 
 			result := writeOneArticle(opts, c)
 			results[idx] = result
 
 			n := int(done.Add(1))
 			if result.Error != nil {
+				if opts.Backpressure != nil && llm.IsRateLimitError(result.Error) {
+					delay := opts.Backpressure.OnRateLimit()
+					log.Warn("rate limited in write pass, backing off", "delay", delay, "new_limit", opts.Backpressure.CurrentLimit())
+					time.Sleep(delay)
+				}
 				log.Error("write article failed", "progress", fmt.Sprintf("%d/%d", n, total), "concept", c.Name, "error", result.Error)
 			} else {
+				if opts.Backpressure != nil {
+					opts.Backpressure.OnSuccess()
+				}
 				log.Info("article written", "progress", fmt.Sprintf("%d/%d", n, total), "concept", c.Name)
 			}
 		}(i, concept)
@@ -99,6 +121,9 @@ func writeOneArticle(opts ArticleWriteOpts, concept ExtractedConcept) ArticleRes
 		existingContent = string(data)
 	}
 
+	// Build source context from relevant sections (document splitting)
+	sourceContext := buildSourceContext(opts.ProjectDir, concept, opts.SplitThreshold)
+
 	// Build prompt
 	relatedNames := findRelatedConcepts(concept)
 	prompt, err := prompts.Render("write_article", prompts.WriteArticleData{
@@ -112,6 +137,7 @@ func writeOneArticle(opts ArticleWriteOpts, concept ExtractedConcept) ArticleRes
 		RelatedList:     strings.Join(relatedNames, ", "),
 		Confidence:      "medium",
 		MaxTokens:       opts.MaxTokens,
+		SourceContext:    sourceContext,
 	}, opts.Language)
 	if err != nil {
 		result.Error = fmt.Errorf("render write_article prompt: %w", err)
@@ -497,4 +523,59 @@ func validateWikilinks(projectDir, outputDir, content string) string {
 		// Link is broken — return just the text without brackets
 		return target
 	})
+}
+
+// buildSourceContext reads source files for a concept, splits large ones
+// by headings, and returns the relevant sections as context for article writing.
+// For small sources (below threshold), includes the full content.
+// Returns empty string if no sources can be read.
+func buildSourceContext(projectDir string, concept ExtractedConcept, threshold int) string {
+	if threshold <= 0 {
+		threshold = 15000 // default from spec
+	}
+
+	var parts []string
+	terms := append([]string{concept.Name, formatConceptName(concept.Name)}, concept.Aliases...)
+
+	for _, srcPath := range concept.Sources {
+		absPath := filepath.Join(projectDir, srcPath)
+		data, err := os.ReadFile(absPath)
+		if err != nil {
+			continue
+		}
+		content := string(data)
+
+		sections := extract.SplitByHeadings(content, threshold)
+		if len(sections) <= 1 {
+			// Small doc or no headings — include as-is (truncated)
+			if len(content) > 4000 {
+				content = content[:4000] + "\n[...truncated...]"
+			}
+			parts = append(parts, fmt.Sprintf("### Source: %s\n\n%s", srcPath, content))
+			continue
+		}
+
+		// Large doc — select relevant sections only
+		relevant := extract.SectionsContaining(sections, terms)
+		if len(relevant) == 0 {
+			// No sections match — use first section as fallback
+			if len(sections) > 0 {
+				relevant = sections[:1]
+			}
+		}
+
+		for _, s := range relevant {
+			header := srcPath
+			if s.Heading != "" {
+				header = srcPath + " > " + s.Heading
+			}
+			text := s.Content
+			if len(text) > 4000 {
+				text = text[:4000] + "\n[...truncated...]"
+			}
+			parts = append(parts, fmt.Sprintf("### Source: %s\n\n%s", header, text))
+		}
+	}
+
+	return strings.Join(parts, "\n\n---\n\n")
 }

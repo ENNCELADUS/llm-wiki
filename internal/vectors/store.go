@@ -33,6 +33,16 @@ func (s *Store) Upsert(id string, embedding []float32) error {
 	})
 }
 
+// Get retrieves a vector by ID. Returns nil, nil if not found.
+func (s *Store) Get(id string) ([]float32, error) {
+	var blob []byte
+	err := s.db.ReadDB().QueryRow("SELECT embedding FROM vec_entries WHERE id=?", id).Scan(&blob)
+	if err != nil {
+		return nil, nil // not found or error
+	}
+	return decodeFloat32s(blob), nil
+}
+
 // Delete removes a vector by ID.
 func (s *Store) Delete(id string) error {
 	return s.db.WriteTx(func(tx *sql.Tx) error {
@@ -237,7 +247,11 @@ func (s *Store) Dimensions() (int, error) {
 }
 
 // CosineSimilarity computes cosine similarity between two vectors.
+// Returns 0 if vectors have different dimensions (safe for mixed-provider scenarios).
 func CosineSimilarity(a, b []float32) float64 {
+	if len(a) != len(b) || len(a) == 0 {
+		return 0
+	}
 	var dot, normA, normB float64
 	for i := range a {
 		ai, bi := float64(a[i]), float64(b[i])

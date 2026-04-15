@@ -84,7 +84,65 @@ type CompilerConfig struct {
 	Timezone         string   `yaml:"timezone,omitempty"`          // IANA timezone for user-facing timestamps (default: UTC)
 	ArticleFields    []string `yaml:"article_fields,omitempty"`    // custom frontmatter fields extracted from LLM response
 
+	// Tiered compilation
+	DefaultTier      int            `yaml:"default_tier,omitempty"`       // default tier for sources (default: 1)
+	TierDefaults     map[string]int `yaml:"tier_defaults,omitempty"`      // file extension → default tier
+	AutoPromote      *bool          `yaml:"auto_promote,omitempty"`       // auto-promote based on signals (default: true)
+	PromoteSignals   PromoteSignals `yaml:"promote_signals,omitempty"`
+	AutoDemote       *bool          `yaml:"auto_demote,omitempty"`        // auto-demote stale articles (default: true)
+	DemoteSignals    DemoteSignals  `yaml:"demote_signals,omitempty"`
+
+	// Document splitting (Phase B)
+	SplitThreshold   int    `yaml:"split_threshold,omitempty"`    // chars, enable section-aware writing above this (default: 15000)
+	SplitStrategy    string `yaml:"split_strategy,omitempty"`     // "headings" (default)
+
+	// Backpressure
+	BackpressureEnabled *bool `yaml:"backpressure,omitempty"`     // enable adaptive backpressure (default: true)
+
+	// Concept deduplication
+	DedupThreshold float64 `yaml:"dedup_threshold,omitempty"` // cosine similarity for auto-merge (default: 0.85)
+	DedupStrategy  string  `yaml:"dedup_strategy,omitempty"`  // "embedding" (default) or "llm"
+
 	resolvedTZ *time.Location `yaml:"-"` // cached by Validate(); not serialized
+}
+
+// PromoteSignals configures when sources are promoted to higher tiers.
+type PromoteSignals struct {
+	QueryHitCount    int    `yaml:"query_hit_count,omitempty"`    // promote after N search hits (default: 3)
+	ClusterSize      int    `yaml:"cluster_size,omitempty"`       // promote when N+ sources on same topic (default: 5)
+	ManualTag        string `yaml:"manual_tag,omitempty"`         // promote if tagged (default: "compile")
+	ImportCentrality int    `yaml:"import_centrality,omitempty"`  // code: promote when N+ files import this (default: 10)
+	SourceRecencyDays int   `yaml:"source_recency_days,omitempty"` // boost recently modified (default: 7)
+}
+
+// DemoteSignals configures when sources are demoted to lower tiers.
+type DemoteSignals struct {
+	SourceModified bool `yaml:"source_modified,omitempty"` // revert to Tier 1 on source change (default: true)
+	StaleDays      int  `yaml:"stale_days,omitempty"`      // demote after N days with no queries (default: 90)
+}
+
+// AutoPromoteEnabled returns whether auto-promotion is enabled (default: true).
+func (c CompilerConfig) AutoPromoteEnabled() bool {
+	if c.AutoPromote == nil {
+		return true
+	}
+	return *c.AutoPromote
+}
+
+// AutoDemoteEnabled returns whether auto-demotion is enabled (default: true).
+func (c CompilerConfig) AutoDemoteEnabled() bool {
+	if c.AutoDemote == nil {
+		return true
+	}
+	return *c.AutoDemote
+}
+
+// BackpressureIsEnabled returns whether backpressure is enabled (default: true).
+func (c CompilerConfig) BackpressureIsEnabled() bool {
+	if c.BackpressureEnabled == nil {
+		return true
+	}
+	return *c.BackpressureEnabled
 }
 
 type SearchConfig struct {
@@ -244,12 +302,14 @@ func Defaults() Config {
 		Output:  "wiki",
 		Sources: []Source{{Path: "raw", Type: "auto", Watch: true}},
 		Compiler: CompilerConfig{
-			MaxParallel:      4,
+			MaxParallel:      20,
 			DebounceSeconds:  2,
 			SummaryMaxTokens: 2000,
 			ArticleMaxTokens: 4000,
 			AutoCommit:       true,
 			AutoLint:         true,
+			DefaultTier:      1,
+			Mode:             "auto",
 		},
 		Search: SearchConfig{
 			HybridWeightBM25:   0.7,

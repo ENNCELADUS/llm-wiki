@@ -13,6 +13,7 @@ import (
 	"unicode"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
+	"github.com/xoai/sage-wiki/internal/compiler"
 	"github.com/xoai/sage-wiki/internal/config"
 	"github.com/xoai/sage-wiki/internal/embed"
 	gitpkg "github.com/xoai/sage-wiki/internal/git"
@@ -100,6 +101,15 @@ func (s *Server) registerWriteTools() {
 			mcplib.WithString("tags", mcplib.Description("Comma-separated tags for captured items")),
 		),
 		s.handleCapture,
+	)
+
+	s.mcp.AddTool(
+		mcplib.NewTool("wiki_compile_topic",
+			mcplib.WithDescription("Compile sources for a specific topic on demand. Finds uncompiled sources matching the topic, promotes them, and runs the full compilation pipeline. Use when wiki_search returns uncompiled_sources > 0."),
+			mcplib.WithString("topic", mcplib.Required(), mcplib.Description("Topic or query to compile sources for")),
+			mcplib.WithNumber("max_sources", mcplib.Description("Maximum sources to compile (default 20)")),
+		),
+		s.handleCompileTopic,
 	)
 }
 
@@ -535,4 +545,45 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+func (s *Server) handleCompileTopic(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	args := req.GetArguments()
+	topic, _ := args["topic"].(string)
+	if topic == "" {
+		return errorResult("topic is required"), nil
+	}
+
+	maxSources := 20
+	if ms, ok := args["max_sources"].(float64); ok && ms > 0 {
+		maxSources = int(ms)
+	}
+
+	cfg, err := config.Load(filepath.Join(s.projectDir, "config.yaml"))
+	if err != nil {
+		return errorResult(fmt.Sprintf("load config: %v", err)), nil
+	}
+
+	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit)
+	if err != nil {
+		return errorResult(fmt.Sprintf("create LLM client: %v", err)), nil
+	}
+
+	result, err := compiler.CompileTopic(ctx, compiler.OnDemandOpts{
+		Topic:       topic,
+		MaxSources:  maxSources,
+		ProjectDir:  s.projectDir,
+		Config:      cfg,
+		DB:          s.db,
+		Searcher:    s.searcher,
+		Embedder:    s.embedder,
+		Client:      client,
+		Coordinator: s.coordinator,
+	})
+	if err != nil {
+		return errorResult(fmt.Sprintf("compile topic: %v", err)), nil
+	}
+
+	data, _ := json.MarshalIndent(result, "", "  ")
+	return textResult(string(data)), nil
 }

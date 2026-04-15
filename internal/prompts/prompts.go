@@ -199,6 +199,7 @@ type WriteArticleData struct {
 	RelatedList     string
 	Confidence      string
 	MaxTokens       int
+	SourceContext    string // relevant source sections (from document splitting)
 }
 
 // CaptionData holds data for image captioning template.

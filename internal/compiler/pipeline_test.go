@@ -111,6 +111,7 @@ compiler:
   max_parallel: 2
   auto_commit: false
   summary_max_tokens: 500
+  default_tier: 3
 `
 	os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(cfgContent), 0644)
 

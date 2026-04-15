@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"os"
@@ -26,48 +27,84 @@ type SummaryResult struct {
 	Error       error
 }
 
+// SummarizeOpts configures a summarization pass.
+type SummarizeOpts struct {
+	Ctx         context.Context // optional; checked between sources for cancellation
+	ProjectDir  string
+	OutputDir   string
+	Sources     []SourceInfo
+	Client      *llm.Client
+	Model       string
+	MaxTokens   int
+	MaxParallel int
+	UserTZ      *time.Location
+	Language    string
+	Backpressure *BackpressureController // optional; if nil, uses fixed semaphore
+}
+
 // Summarize processes sources through Pass 1, producing summaries.
-func Summarize(
-	projectDir string,
-	outputDir string,
-	sources []SourceInfo,
-	client *llm.Client,
-	model string,
-	maxTokens int,
-	maxParallel int,
-	userTZ *time.Location,
-	language string,
-) []SummaryResult {
+func Summarize(opts SummarizeOpts) []SummaryResult {
+	maxParallel := opts.MaxParallel
 	if maxParallel <= 0 {
-		maxParallel = 4
+		maxParallel = 20
 	}
 
-	results := make([]SummaryResult, len(sources))
-	sem := make(chan struct{}, maxParallel)
+	results := make([]SummaryResult, len(opts.Sources))
 	var wg sync.WaitGroup
 	var done atomic.Int32
 	var consecutiveErrors atomic.Int32
-	total := len(sources)
+	total := len(opts.Sources)
 	var stopped atomic.Bool
 
-	for i, src := range sources {
+	// Use BackpressureController if available, otherwise fixed semaphore
+	var sem chan struct{}
+	if opts.Backpressure == nil {
+		sem = make(chan struct{}, maxParallel)
+	}
+
+	for i, src := range opts.Sources {
+		// Check for context cancellation between sources
+		if opts.Ctx != nil {
+			select {
+			case <-opts.Ctx.Done():
+				results[i] = SummaryResult{SourcePath: src.Path, Error: fmt.Errorf("cancelled: %w", opts.Ctx.Err())}
+				stopped.Store(true)
+				continue
+			default:
+			}
+		}
+
 		if stopped.Load() {
 			results[i] = SummaryResult{SourcePath: src.Path, Error: fmt.Errorf("skipped: circuit breaker triggered")}
 			continue
 		}
 
 		wg.Add(1)
-		sem <- struct{}{}
+
+		// Acquire concurrency slot
+		var release func()
+		if opts.Backpressure != nil {
+			release = opts.Backpressure.Acquire()
+		} else {
+			sem <- struct{}{}
+			release = func() { <-sem }
+		}
 
 		go func(idx int, info SourceInfo) {
 			defer wg.Done()
-			defer func() { <-sem }()
+			defer release()
 
-			result := summarizeOne(projectDir, outputDir, info, client, model, maxTokens, userTZ, language)
+			result := summarizeOne(opts.ProjectDir, opts.OutputDir, info, opts.Client, opts.Model, opts.MaxTokens, opts.UserTZ, opts.Language)
 			results[idx] = result
 
 			n := int(done.Add(1))
 			if result.Error != nil {
+				// Signal backpressure controller on rate limit errors
+				if opts.Backpressure != nil && llm.IsRateLimitError(result.Error) {
+					delay := opts.Backpressure.OnRateLimit()
+					log.Warn("rate limited, backing off", "delay", delay, "new_limit", opts.Backpressure.CurrentLimit())
+					time.Sleep(delay)
+				}
 				errCount := consecutiveErrors.Add(1)
 				log.Error("summarize failed", "progress", fmt.Sprintf("%d/%d", n, total), "source", info.Path, "error", result.Error)
 				if errCount >= 5 {
@@ -75,6 +112,9 @@ func Summarize(
 					stopped.Store(true)
 				}
 			} else {
+				if opts.Backpressure != nil {
+					opts.Backpressure.OnSuccess()
+				}
 				consecutiveErrors.Store(0)
 				log.Info("summarized", "progress", fmt.Sprintf("%d/%d", n, total), "source", info.Path)
 			}

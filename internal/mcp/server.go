@@ -10,6 +10,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/xoai/sage-wiki/internal/compiler"
 	"github.com/xoai/sage-wiki/internal/config"
 	"github.com/xoai/sage-wiki/internal/embed"
 	"github.com/xoai/sage-wiki/internal/hybrid"
@@ -24,20 +25,23 @@ import (
 
 // Server wraps an MCP server with wiki tools.
 type Server struct {
-	mcp        *server.MCPServer
-	projectDir string
-	db         *storage.DB
-	mem        *memory.Store
-	vec        *vectors.Store
-	ont        *ontology.Store
-	searcher   *hybrid.Searcher
-	cfg        *config.Config
-	embedder   embed.Embedder
-	language   string
+	mcp         *server.MCPServer
+	projectDir  string
+	db          *storage.DB
+	mem         *memory.Store
+	vec         *vectors.Store
+	ont         *ontology.Store
+	searcher    *hybrid.Searcher
+	cfg         *config.Config
+	embedder    embed.Embedder
+	language    string
+	coordinator *compiler.CompileCoordinator // serializes compiles
 }
 
 // NewServer creates an MCP server with read tools registered.
-func NewServer(projectDir string) (*Server, error) {
+// If coordinator is provided, it's used to serialize compile-on-demand
+// with background compiles. If nil, a new coordinator is created.
+func NewServer(projectDir string, coordinator ...*compiler.CompileCoordinator) (*Server, error) {
 	cfgPath := filepath.Join(projectDir, "config.yaml")
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
@@ -57,16 +61,24 @@ func NewServer(projectDir string) (*Server, error) {
 	ont := ontology.NewStore(db, ontology.ValidRelationNames(mergedRels), ontology.ValidEntityTypeNames(mergedTypes))
 	searcher := hybrid.NewSearcher(mem, vec)
 
+	var cc *compiler.CompileCoordinator
+	if len(coordinator) > 0 && coordinator[0] != nil {
+		cc = coordinator[0]
+	} else {
+		cc = compiler.NewCompileCoordinator()
+	}
+
 	s := &Server{
-		projectDir: projectDir,
-		db:         db,
-		mem:        mem,
-		vec:        vec,
-		ont:        ont,
-		searcher:   searcher,
-		cfg:        cfg,
-		embedder:   embed.NewFromConfig(cfg),
-		language:   cfg.Language,
+		projectDir:  projectDir,
+		db:          db,
+		mem:         mem,
+		vec:         vec,
+		ont:         ont,
+		searcher:    searcher,
+		cfg:         cfg,
+		embedder:    embed.NewFromConfig(cfg),
+		language:    cfg.Language,
+		coordinator: cc,
 	}
 
 	mcpServer := server.NewMCPServer(
@@ -134,6 +146,7 @@ func (s *Server) CallTool(ctx context.Context, name string, req mcp.CallToolRequ
 		"wiki_compile":       s.handleCompile,
 		"wiki_lint":          s.handleLint,
 		"wiki_capture":       s.handleCapture,
+		"wiki_compile_topic": s.handleCompileTopic,
 		"wiki_provenance":    s.handleProvenance,
 	}
 	if h, ok := handlers[name]; ok {
@@ -242,8 +255,60 @@ func (s *Server) handleSearch(ctx context.Context, req mcp.CallToolRequest) (*mc
 		return errorResult(err.Error()), nil
 	}
 
-	data, _ := json.MarshalIndent(results, "", "  ")
+	// Count uncompiled sources matching the query (search response signaling)
+	uncompiledCount := s.countUncompiledMatches(query)
+
+	// Record query hits for promotion tracking
+	if uncompiledCount > 0 {
+		items := compiler.NewCompileItemStore(s.db)
+		tierMgr := compiler.NewTierManager(&s.cfg.Compiler, items)
+		var hitPaths []string
+		for _, r := range results {
+			hitPaths = append(hitPaths, r.ID)
+		}
+		tierMgr.RecordQueryHit(hitPaths)
+	}
+
+	// Build response with optional signaling
+	type searchResponse struct {
+		Results           []hybrid.SearchResult `json:"results"`
+		UncompiledSources int                   `json:"uncompiled_sources,omitempty"`
+		CompileHint       string                `json:"compile_hint,omitempty"`
+	}
+
+	resp := searchResponse{Results: results}
+	if uncompiledCount > 0 {
+		resp.UncompiledSources = uncompiledCount
+		resp.CompileHint = fmt.Sprintf(
+			"Found %d matching sources that haven't been fully compiled. "+
+				"Use wiki_compile_topic(\"%s\") to compile them for richer results.",
+			uncompiledCount, query)
+	}
+
+	data, _ := json.MarshalIndent(resp, "", "  ")
 	return textResult(string(data)), nil
+}
+
+// countUncompiledMatches counts FTS5 entries with "src:" prefix matching
+// the query that are below Tier 3 in compile_items.
+func (s *Server) countUncompiledMatches(query string) int {
+	// Sanitize query for FTS5 (reuse existing sanitization)
+	sanitized := memory.SanitizeFTS(query)
+	if sanitized == "" {
+		return 0
+	}
+
+	var count int
+	err := s.db.ReadDB().QueryRow(`
+		SELECT COUNT(*) FROM entries
+		JOIN compile_items ON compile_items.source_path = SUBSTR(entries.id, 5)
+		WHERE entries MATCH ? AND entries.id LIKE 'src:%'
+		AND compile_items.tier < 3
+	`, sanitized).Scan(&count)
+	if err != nil {
+		return 0 // table may not exist yet
+	}
+	return count
 }
 
 func (s *Server) handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -275,6 +340,7 @@ func (s *Server) handleStatus(ctx context.Context, req mcp.CallToolRequest) (*mc
 		Mem: s.mem,
 		Vec: s.vec,
 		Ont: s.ont,
+		DB:  s.db,
 	})
 	if err != nil {
 		return errorResult(err.Error()), nil

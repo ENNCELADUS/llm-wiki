@@ -145,6 +145,7 @@ func (db *DB) migrate() error {
 		{sql: migrationV2},
 		{sql: migrationV3},
 		{sql: migrationV4, disableFK: true},
+		{sql: migrationV5},
 	}
 
 	for i := version; i < len(migrations); i++ {
@@ -327,4 +328,54 @@ ALTER TABLE relations_rebuild RENAME TO relations;
 CREATE INDEX IF NOT EXISTS idx_relations_source ON relations(source_id);
 CREATE INDEX IF NOT EXISTS idx_relations_target ON relations(target_id);
 CREATE INDEX IF NOT EXISTS idx_relations_type ON relations(relation);
+`
+
+// migrationV5 adds the compile_items table for per-item compilation state and tier tracking.
+// This replaces the JSON compile-state.json with per-item state in SQLite.
+const migrationV5 = `
+CREATE TABLE IF NOT EXISTS compile_items (
+	source_path     TEXT PRIMARY KEY,
+	hash            TEXT NOT NULL DEFAULT '',
+	file_type       TEXT NOT NULL DEFAULT '',
+	size_bytes      INTEGER NOT NULL DEFAULT 0,
+
+	-- Tier state (0=index only, 1=index+embed, 2=code parse, 3=full compile)
+	tier            INTEGER NOT NULL DEFAULT 1,
+	tier_default    INTEGER NOT NULL DEFAULT 1,
+	tier_override   INTEGER,
+
+	-- Per-pass completion (0 = not done, 1 = done)
+	pass_indexed    INTEGER NOT NULL DEFAULT 0,
+	pass_embedded   INTEGER NOT NULL DEFAULT 0,
+	pass_parsed     INTEGER NOT NULL DEFAULT 0,
+	pass_summarized INTEGER NOT NULL DEFAULT 0,
+	pass_extracted  INTEGER NOT NULL DEFAULT 0,
+	pass_written    INTEGER NOT NULL DEFAULT 0,
+
+	-- Compilation metadata
+	compile_id      TEXT,
+	error           TEXT,
+	error_count     INTEGER NOT NULL DEFAULT 0,
+	summary_path    TEXT,
+
+	-- Promotion/demotion signals
+	query_hit_count INTEGER NOT NULL DEFAULT 0,
+	last_queried_at TEXT,
+	promoted_at     TEXT,
+	demoted_at      TEXT,
+
+	-- Quality tracking
+	source_type     TEXT NOT NULL DEFAULT 'compiler',
+	quality_score   REAL,
+
+	-- Timestamps
+	created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+	updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ci_tier ON compile_items(tier);
+CREATE INDEX IF NOT EXISTS idx_ci_type ON compile_items(file_type);
+CREATE INDEX IF NOT EXISTS idx_ci_compile ON compile_items(compile_id);
+CREATE INDEX IF NOT EXISTS idx_ci_hits ON compile_items(query_hit_count);
+CREATE INDEX IF NOT EXISTS idx_ci_queried ON compile_items(last_queried_at);
 `

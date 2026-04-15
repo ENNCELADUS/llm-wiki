@@ -22,11 +22,13 @@ type Source struct {
 	Type             string   `json:"type"`
 	SizeBytes        int64    `json:"size_bytes"`
 	AddedAt          string   `json:"added_at"`
-	CompiledAt       string   `json:"compiled_at,omitempty"`
+	CompiledAt       string   `json:"compiled_at,omitempty"`  // Deprecated: use compile_items table
 	SummaryPath      string   `json:"summary_path,omitempty"`
 	ConceptsProduced []string `json:"concepts_produced,omitempty"`
 	ChunkCount       int      `json:"chunk_count,omitempty"`
-	Status           string   `json:"status"` // pending, compiled, error
+	Status           string   `json:"status"`                   // Deprecated: use compile_items table
+	Tier             int      `json:"tier,omitempty"`            // 0-3, compilation tier
+	SourceType       string   `json:"source_type,omitempty"`     // compiler, scribe, manual
 }
 
 // Concept represents a tracked concept.
