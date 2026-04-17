@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.1.5 — 2026-04-17
+
+### Agent Skill Templates
+
+Agents ignore sage-wiki's 17 MCP tools because nothing tells them *when* to use them. Skill templates are behavioral bridges — generated snippets appended to agent instruction files.
+
+- **`sage-wiki init --skill <agent>`** — Generate a skill file during project init. Supported agents: `claude-code`, `cursor`, `windsurf`, `agents-md`, `codex`, `gemini`, `generic`.
+- **`sage-wiki skill refresh`** — Regenerate the skill section on an existing project. Marker-based replacement preserves surrounding content.
+- **`sage-wiki skill preview`** — Preview the generated skill without writing files.
+- **4 domain packs** — `codebase-memory` (default for code projects), `research-library` (paper/article projects), `meeting-notes`, `documentation-curator`. Auto-selected from source types in config, overridable via `--pack`.
+- **Project-specific content** — Templates reference actual entity types, relation types, and MCP tools from your config.yaml.
+- **Safe on existing projects** — Running `init --skill` on an already-initialized project skips project creation and only generates the skill file.
+
+### Compile Options Harmonization
+
+Fixed `--watch --prune` silently dropping `--prune` (GitHub issue #61). All compile options now flow correctly through all 5 entry points.
+
+- **`--watch --prune` works** — Watch mode passes all compile options (`--prune`, `--no-cache`, `--fresh`) to both initial and triggered compiles.
+- **`--batch --watch` rejected** — Clear error instead of undefined behavior.
+- **`--fresh` under watch** — Applies only to the initial compile; subsequent triggered compiles skip fresh to avoid re-processing the entire wiki on every edit.
+- **Pending batch detection** — Watch mode refuses to start when a batch compile is in progress, with an actionable error message.
+- **Orphan preservation** — When `--prune` is not set and a source removal would orphan an article, all state mutations are deferred (manifest, memory store, vector store, concept references). A subsequent `--prune` run cleanly removes the orphan. Previously, state was scrubbed immediately, stranding the orphan permanently.
+- **MCP `wiki_compile` gets `prune`** — The `prune` argument is now available on the MCP tool.
+- **`hub compile --prune`** — New flag on the hub multi-project compile command.
+- **TUI plumbing** — CompileOpts threaded through the TUI compile model (UI toggle deferred).
+
 ## 0.1.4 — 2026-04-15
 
 ### Large Vault Performance

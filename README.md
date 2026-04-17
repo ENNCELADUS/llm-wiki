@@ -114,7 +114,7 @@ See the [self-hosting guide](docs/guides/self-hosted-server.md) for Docker Compo
 
 | Command                                                                                 | Description                                      |
 | --------------------------------------------------------------------------------------- | ------------------------------------------------ |
-| `sage-wiki init [--vault]`                                                              | Initialize project (greenfield or vault overlay) |
+| `sage-wiki init [--vault] [--skill <agent>]`                                            | Initialize project (greenfield or vault overlay) |
 | `sage-wiki compile [--watch] [--dry-run] [--batch] [--estimate] [--no-cache] [--prune]` | Compile sources into wiki articles               |
 | `sage-wiki serve [--transport stdio\|sse]`                                              | Start MCP server for LLM agents                  |
 | `sage-wiki serve --ui [--port 3333]`                                                    | Start web UI (requires `-tags webui` build)      |
@@ -134,6 +134,7 @@ See the [self-hosting guide](docs/guides/self-hosted-server.md) for Docker Compo
 | `sage-wiki learn "text"`                                                                | Store a learning entry                           |
 | `sage-wiki capture "text"`                                                              | Capture knowledge from text                      |
 | `sage-wiki add-source <path>`                                                           | Register a source file in the manifest           |
+| `sage-wiki skill <refresh\|preview> [--target <agent>]`                                 | Generate or refresh agent skill files            |
 | `sage-wiki scribe <session-file>`                                                       | Extract entities from a session transcript       |
 
 ## TUI
@@ -439,6 +440,33 @@ created_at: 2026-04-10T08:00:00+08:00
 
 Ground-truth fields (`concept`, `aliases`, `sources`, `created_at`) are always accurate — they come from the extraction pass, not the LLM. Semantic fields (`confidence` + your custom fields) reflect the LLM's judgment.
 
+## Agent Skill Files
+
+sage-wiki has 17 MCP tools, but agents won't use them unless something in their context says *when* to check the wiki. Skill files bridge that gap — generated snippets that teach agents when to search, what to capture, and how to query effectively.
+
+```bash
+# Generate during project init
+sage-wiki init --skill claude-code
+
+# Or add to an existing project
+sage-wiki skill refresh --target claude-code
+
+# Preview without writing
+sage-wiki skill preview --target cursor
+```
+
+This appends a behavioral skill section to the agent's instruction file (CLAUDE.md, .cursorrules, etc.) with project-specific triggers, capture guidelines, and query examples derived from your config.yaml.
+
+**Supported agents:** `claude-code`, `cursor`, `windsurf`, `agents-md` (Antigravity/Codex), `gemini`, `generic`
+
+**Domain packs:** The generator auto-selects a pack based on your source types:
+- `codebase-memory` — code projects (default). Triggers on API changes, refactors, breaking changes.
+- `research-library` — paper/article projects. Triggers on domain questions, related work.
+- `meeting-notes` — operational use (override only: `--pack meeting-notes`).
+- `documentation-curator` — documentation projects (override only: `--pack documentation-curator`).
+
+Running `skill refresh` regenerates only the marked skill section — your other content is preserved.
+
 ## MCP Integration
 
 ![MCP Integration](sage-wiki-interfaces.png)
@@ -476,7 +504,7 @@ The `wiki_capture` tool extracts knowledge items (decisions, discoveries, correc
 
 For single facts, `wiki_learn` stores a nugget directly. For full documents, `wiki_add_source` ingests a file. Run `wiki_compile` to process everything into articles.
 
-See the full setup guide: [MCP Knowledge Capture Guide](docs/guides/mcp-knowledge-capture.md)
+See the full setup guide: [Agent Memory Layer Guide](docs/guides/agent-memory-layer.md)
 
 ## Benchmarks
 

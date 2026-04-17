@@ -114,7 +114,7 @@ docker run -d -p 3333:3333 -v ./my-wiki:/wiki -e GEMINI_API_KEY=... sage-wiki
 
 | 命令                                                                                    | 说明                                  |
 | --------------------------------------------------------------------------------------- | ------------------------------------- |
-| `sage-wiki init [--vault]`                                                              | 初始化项目 (全新或 vault 覆盖模式)    |
+| `sage-wiki init [--vault] [--skill <agent>]`                                            | 初始化项目 (全新或 vault 覆盖模式)    |
 | `sage-wiki compile [--watch] [--dry-run] [--batch] [--estimate] [--no-cache] [--prune]` | 将源文件编译为 wiki 文章              |
 | `sage-wiki serve [--transport stdio\|sse]`                                              | 启动 MCP 服务器供 LLM Agent 使用      |
 | `sage-wiki serve --ui [--port 3333]`                                                    | 启动 Web UI (需要 `-tags webui` 构建) |
@@ -134,6 +134,7 @@ docker run -d -p 3333:3333 -v ./my-wiki:/wiki -e GEMINI_API_KEY=... sage-wiki
 | `sage-wiki learn "text"`                                                                | 存储学习条目                          |
 | `sage-wiki capture "text"`                                                              | 从文本中捕获知识                      |
 | `sage-wiki add-source <path>`                                                           | 在 manifest 中注册源文件              |
+| `sage-wiki skill <refresh\|preview> [--target <agent>]`                                 | 生成或刷新 Agent 技能文件             |
 | `sage-wiki scribe <session-file>`                                                       | 从会话记录中提取实体                  |
 
 ## TUI
@@ -439,6 +440,33 @@ created_at: 2026-04-10T08:00:00+08:00
 
 确定性字段 (`concept`、`aliases`、`sources`、`created_at`) 始终准确 -- 它们来自提取阶段,而非 LLM。语义字段 (`confidence` + 你的自定义字段) 反映 LLM 的判断。
 
+## Agent 技能文件
+
+sage-wiki 提供 17 个 MCP 工具,但 Agent 不会主动使用它们,除非上下文中告诉了 Agent *何时*该查询 wiki。技能文件弥补了这个差距 -- 生成的代码片段教会 Agent 何时搜索、何时捕获知识、如何高效查询。
+
+```bash
+# 初始化项目时生成
+sage-wiki init --skill claude-code
+
+# 或在已有项目上添加
+sage-wiki skill refresh --target claude-code
+
+# 预览但不写入文件
+sage-wiki skill preview --target cursor
+```
+
+这会在 Agent 的指令文件 (CLAUDE.md、.cursorrules 等) 中追加一个行为技能片段,包含根据 config.yaml 生成的项目特定触发器、捕获指南和查询示例。
+
+**支持的 Agent:** `claude-code`、`cursor`、`windsurf`、`agents-md` (Antigravity/Codex)、`gemini`、`generic`
+
+**领域模板包:**  生成器根据源文件类型自动选择模板包:
+- `codebase-memory` -- 代码项目 (默认)。触发条件: API 变更、重构、破坏性改动。
+- `research-library` -- 论文/文章项目。触发条件: 领域问题、相关工作。
+- `meeting-notes` -- 运营场景 (仅通过 `--pack meeting-notes` 手动指定)。
+- `documentation-curator` -- 文档项目 (仅通过 `--pack documentation-curator` 手动指定)。
+
+运行 `skill refresh` 仅重新生成标记的技能片段 -- 你的其他内容不会被修改。
+
 ## MCP 集成
 
 ![MCP Integration](sage-wiki-interfaces.png)
@@ -476,7 +504,7 @@ sage-wiki 作为 MCP 服务器运行,因此你可以直接从 AI 对话中捕获
 
 对于单条事实,`wiki_learn` 可直接存储。对于完整文档,`wiki_add_source` 可导入文件。运行 `wiki_compile` 处理所有内容为文章。
 
-参阅完整配置指南: [MCP 知识捕获指南](docs/guides/mcp-knowledge-capture.md)
+参阅完整配置指南: [Agent 记忆层指南](docs/guides/agent-memory-layer.md)
 
 ## 基准测试
 

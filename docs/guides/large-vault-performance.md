@@ -345,4 +345,4 @@ Reports low-quality articles, tier distribution, and compilation errors.
 - [Search Quality](search-quality.md) — chunk-level indexing, query expansion, re-ranking
 - [Configurable Relations](configurable-relations.md) — custom ontology types
 - [Self-Hosted Server](self-hosted-server.md) — Docker, Syncthing, reverse proxy
-- [MCP Knowledge Capture](mcp-knowledge-capture.md) — capturing from AI conversations
+- [Agent Memory Layer](agent-memory-layer.md) — skill files, MCP setup, and knowledge capture
