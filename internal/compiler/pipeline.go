@@ -917,13 +917,30 @@ func filterSuccessful(summaries []SummaryResult) []SummaryResult {
 	return result
 }
 
+// hasSoleSourceOrphan returns true if removing removedPath would orphan at least
+// one concept (i.e., a concept whose only source is removedPath).
+func hasSoleSourceOrphan(mf *manifest.Manifest, removedPath string) bool {
+	for _, name := range mf.ArticlesFromSource(removedPath) {
+		if c, ok := mf.Concepts[name]; ok && len(c.Sources) <= 1 {
+			return true
+		}
+	}
+	return false
+}
+
 // handleRemovedSources processes removed source files, detecting orphaned articles
-// and optionally pruning them. Must be called BEFORE mf.RemoveSource() since it
-// needs the manifest entries to look up affected concepts.
+// and optionally pruning them. When prune=false and an orphan would result, ALL
+// state mutations for that source are deferred to preserve recovery via later --prune.
 func handleRemovedSources(projectDir string, removed []string, mf *manifest.Manifest,
 	memStore *memory.Store, vecStore *vectors.Store, ontStore *ontology.Store, prune bool) {
 
 	for _, removedPath := range removed {
+		if !prune && hasSoleSourceOrphan(mf, removedPath) {
+			log.Info("deferred source removal (orphaned concepts pending prune)",
+				"path", removedPath)
+			continue
+		}
+
 		affectedConcepts := mf.ArticlesFromSource(removedPath)
 		for _, conceptName := range affectedConcepts {
 			concept, ok := mf.Concepts[conceptName]

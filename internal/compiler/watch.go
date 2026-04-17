@@ -19,16 +19,21 @@ import (
 // received (common on WSL2 /mnt/ paths and network drives).
 // If coordinator is non-nil, it is used to serialize compiles with on-demand
 // requests. If nil, a local coordinator is created.
-func Watch(projectDir string, debounceSeconds int, coordinator ...*CompileCoordinator) error {
+func Watch(projectDir string, debounceSeconds int, opts CompileOpts, coordinator ...*CompileCoordinator) error {
 	var cc *CompileCoordinator
 	if len(coordinator) > 0 && coordinator[0] != nil {
 		cc = coordinator[0]
 	} else {
 		cc = NewCompileCoordinator()
 	}
-	_ = cc // used below
 	if debounceSeconds <= 0 {
 		debounceSeconds = 2
+	}
+
+	// D5: reject watch when a pending batch exists on disk
+	statePath := filepath.Join(projectDir, ".sage", "compile-state.json")
+	if state, _ := loadCompileState(statePath); state != nil && state.Batch != nil {
+		return fmt.Errorf("pending batch compile detected; run 'sage-wiki compile' to complete it before starting watch mode")
 	}
 
 	cfgPath := filepath.Join(projectDir, "config.yaml")
@@ -39,9 +44,9 @@ func Watch(projectDir string, debounceSeconds int, coordinator ...*CompileCoordi
 
 	sourcePaths := cfg.ResolveSources(projectDir)
 
-	// Run initial compile to catch files added while watcher was stopped
+	// Run initial compile with full opts (including Fresh if set)
 	log.Info("running initial compile before watching")
-	if result, err := Compile(projectDir, CompileOpts{}); err != nil {
+	if result, err := Compile(projectDir, opts); err != nil {
 		log.Error("initial compile failed", "error", err)
 	} else if result.Added > 0 || result.Modified > 0 || result.Removed > 0 {
 		log.Info("initial compile complete",
@@ -53,6 +58,10 @@ func Watch(projectDir string, debounceSeconds int, coordinator ...*CompileCoordi
 	} else {
 		log.Info("initial compile: nothing new to process")
 	}
+
+	// D4: subsequent triggered compiles never use Fresh
+	triggerOpts := opts
+	triggerOpts.Fresh = false
 
 	// Try fsnotify first
 	watcher, fsErr := fsnotify.NewWatcher()
@@ -80,16 +89,16 @@ func Watch(projectDir string, debounceSeconds int, coordinator ...*CompileCoordi
 			watcher.Close()
 		}
 		log.Info("using polling mode (inotify unavailable for these paths)", "sources", sourcePaths, "interval", fmt.Sprintf("%ds", debounceSeconds*2))
-		return watchPoll(projectDir, sourcePaths, cfg.Ignore, debounceSeconds*2, cc)
+		return watchPoll(projectDir, sourcePaths, cfg.Ignore, debounceSeconds*2, triggerOpts, cc)
 	}
 
 	defer watcher.Close()
 	log.Info("watching for changes (fsnotify)", "sources", sourcePaths, "debounce", debounceSeconds)
-	return watchFsnotify(projectDir, watcher, debounceSeconds, cc)
+	return watchFsnotify(projectDir, watcher, debounceSeconds, triggerOpts, cc)
 }
 
 // watchFsnotify uses inotify-based watching (works on native Linux, macOS).
-func watchFsnotify(projectDir string, watcher *fsnotify.Watcher, debounceSeconds int, cc *CompileCoordinator) error {
+func watchFsnotify(projectDir string, watcher *fsnotify.Watcher, debounceSeconds int, opts CompileOpts, cc *CompileCoordinator) error {
 	debounce := time.Duration(debounceSeconds) * time.Second
 	var timer *time.Timer
 	var lastTrigger string
@@ -120,7 +129,7 @@ func watchFsnotify(projectDir string, watcher *fsnotify.Watcher, debounceSeconds
 			}
 			trigger := lastTrigger
 			timer = time.AfterFunc(debounce, func() {
-				triggerCompile(projectDir, trigger, cc)
+				triggerCompile(projectDir, trigger, opts, cc)
 			})
 
 		case err, ok := <-watcher.Errors:
@@ -134,7 +143,7 @@ func watchFsnotify(projectDir string, watcher *fsnotify.Watcher, debounceSeconds
 
 // watchPoll periodically scans source directories for changes.
 // Works on WSL2 /mnt/ paths, network drives, and any filesystem.
-func watchPoll(projectDir string, sourcePaths []string, ignore []string, intervalSeconds int, cc *CompileCoordinator) error {
+func watchPoll(projectDir string, sourcePaths []string, ignore []string, intervalSeconds int, opts CompileOpts, cc *CompileCoordinator) error {
 
 	// Build initial snapshot
 	snapshot := scanSnapshot(sourcePaths, ignore)
@@ -172,7 +181,7 @@ func watchPoll(projectDir string, sourcePaths []string, ignore []string, interva
 
 		if len(changed) > 0 {
 			log.Info("changes detected", "count", len(changed))
-			triggerCompile(projectDir, changed[0], cc)
+			triggerCompile(projectDir, changed[0], opts, cc)
 		}
 	}
 
@@ -232,10 +241,12 @@ func fullHash(path string) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-func triggerCompile(projectDir string, trigger string, cc *CompileCoordinator) {
+var compileFn = Compile
+
+func triggerCompile(projectDir string, trigger string, opts CompileOpts, cc *CompileCoordinator) {
 	ok, err := cc.TryCompile(func() error {
 		log.Info("compiling after change", "trigger", trigger)
-		result, err := Compile(projectDir, CompileOpts{})
+		result, err := compileFn(projectDir, opts)
 		if err != nil {
 			log.Error("compile failed", "error", err)
 			return err

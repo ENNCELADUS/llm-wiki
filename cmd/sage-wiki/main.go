@@ -285,14 +285,22 @@ func runCompile(cmd *cobra.Command, args []string) error {
 		return runEstimate(dir)
 	}
 
-	if watch {
-		fmt.Println("Watching for changes... (Ctrl+C to stop)")
-		return compiler.Watch(dir, 2)
-	}
-
 	batch, _ := cmd.Flags().GetBool("batch")
 	noCache, _ := cmd.Flags().GetBool("no-cache")
 	prune, _ := cmd.Flags().GetBool("prune")
+
+	if watch && batch {
+		return fmt.Errorf("batch mode is incompatible with watch mode: batch compiles cannot be triggered by watch events")
+	}
+
+	if watch {
+		fmt.Println("Watching for changes... (Ctrl+C to stop)")
+		return compiler.Watch(dir, 2, compiler.CompileOpts{
+			Fresh:   fresh,
+			NoCache: noCache,
+			Prune:   prune,
+		})
+	}
 
 	// Interactive cost estimate prompt if config.compiler.estimate_before is true
 	if err := maybePromptEstimate(dir); err != nil {

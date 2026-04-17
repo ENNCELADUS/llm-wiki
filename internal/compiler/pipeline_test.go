@@ -273,7 +273,6 @@ func TestHandleRemovedSources_SingleSourcePrune(t *testing.T) {
 func TestHandleRemovedSources_SingleSourceNoPrune(t *testing.T) {
 	dir := t.TempDir()
 
-	// Create article file
 	conceptDir := filepath.Join(dir, "wiki", "concepts")
 	os.MkdirAll(conceptDir, 0755)
 	articlePath := filepath.Join("wiki", "concepts", "attention.md")
@@ -290,34 +289,144 @@ func TestHandleRemovedSources_SingleSourceNoPrune(t *testing.T) {
 	ontStore := ontology.NewStore(db, nil, nil)
 
 	memStore.Add(memory.Entry{ID: "concept:attention", Content: "Attention", Tags: []string{"concept"}, ArticlePath: articlePath})
+	memStore.Add(memory.Entry{ID: "raw/paper.pdf", Content: "paper source", Tags: []string{"source"}})
+	vecStore.Upsert("raw/paper.pdf", []float32{0.1, 0.2, 0.3})
 	ontStore.AddEntity(ontology.Entity{ID: "attention", Type: "concept", Name: "Attention", ArticlePath: articlePath})
 
 	mf := manifest.New()
 	mf.AddSource("raw/paper.pdf", "sha256:abc", "paper", 5000)
 	mf.AddConcept("attention", articlePath, []string{"raw/paper.pdf"})
 
-	// Execute cascade with prune=false (warn only)
 	handleRemovedSources(dir, []string{"raw/paper.pdf"}, mf, memStore, vecStore, ontStore, false)
 
-	// Verify: article file still exists (no prune)
+	// D2: ALL state mutations deferred when orphan + no prune
 	if _, err := os.Stat(filepath.Join(dir, articlePath)); os.IsNotExist(err) {
 		t.Error("article file should NOT be deleted without --prune")
 	}
-
-	// Verify: FTS5 entry still exists
-	results, _ := memStore.Search("attention", nil, 10)
-	if len(results) != 1 {
-		t.Errorf("expected 1 FTS5 result (not pruned), got %d", len(results))
-	}
-
-	// Verify: concept still in manifest (orphaned but not deleted)
 	if mf.ConceptCount() != 1 {
 		t.Errorf("expected 1 concept (orphaned, not pruned), got %d", mf.ConceptCount())
 	}
+	c := mf.Concepts["attention"]
+	if len(c.Sources) != 1 || c.Sources[0] != "raw/paper.pdf" {
+		t.Errorf("expected sources [raw/paper.pdf] preserved, got %v", c.Sources)
+	}
+	if mf.SourceCount() != 1 {
+		t.Errorf("expected 1 source (preserved for recovery), got %d", mf.SourceCount())
+	}
+	entry, err := memStore.Get("raw/paper.pdf")
+	if err != nil || entry == nil {
+		t.Errorf("expected memStore entry preserved, got entry=%v err=%v", entry, err)
+	}
+	vec, err := vecStore.Get("raw/paper.pdf")
+	if err != nil || vec == nil {
+		t.Errorf("expected vecStore entry preserved, got vec=%v err=%v", vec, err)
+	}
 
-	// Verify: source removed from manifest
+	// A subsequent prune=true call should clean up
+	handleRemovedSources(dir, []string{"raw/paper.pdf"}, mf, memStore, vecStore, ontStore, true)
+	if _, err := os.Stat(filepath.Join(dir, articlePath)); !os.IsNotExist(err) {
+		t.Error("article file should be deleted after prune")
+	}
 	if mf.SourceCount() != 0 {
-		t.Errorf("expected 0 sources, got %d", mf.SourceCount())
+		t.Errorf("expected 0 sources after prune, got %d", mf.SourceCount())
+	}
+	if mf.ConceptCount() != 0 {
+		t.Errorf("expected 0 concepts after prune, got %d", mf.ConceptCount())
+	}
+	entry, err = memStore.Get("raw/paper.pdf")
+	if entry != nil {
+		t.Errorf("expected memStore entry cleaned after prune, got %v", entry)
+	}
+	vec, err = vecStore.Get("raw/paper.pdf")
+	if vec != nil {
+		t.Errorf("expected vecStore entry cleaned after prune, got %v", vec)
+	}
+}
+
+func TestHandleRemovedSources_MixedOrphanMultiSource(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := storage.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	memStore := memory.NewStore(db)
+	vecStore := vectors.NewStore(db)
+	ontStore := ontology.NewStore(db, nil, nil)
+
+	memStore.Add(memory.Entry{ID: "raw/shared.md", Content: "shared source", Tags: []string{"source"}})
+	vecStore.Upsert("raw/shared.md", []float32{0.1, 0.2, 0.3})
+
+	mf := manifest.New()
+	mf.AddSource("raw/shared.md", "sha256:aaa", "article", 1000)
+	mf.AddSource("raw/other.md", "sha256:bbb", "article", 1000)
+	mf.AddConcept("alpha", "wiki/concepts/alpha.md", []string{"raw/shared.md"})
+	mf.AddConcept("beta", "wiki/concepts/beta.md", []string{"raw/shared.md", "raw/other.md"})
+
+	handleRemovedSources(dir, []string{"raw/shared.md"}, mf, memStore, vecStore, ontStore, false)
+
+	// D2: orphan (alpha) implicated → ALL mutations deferred for this source
+	if mf.SourceCount() != 2 {
+		t.Errorf("expected 2 sources (deferred), got %d", mf.SourceCount())
+	}
+	alpha := mf.Concepts["alpha"]
+	if len(alpha.Sources) != 1 || alpha.Sources[0] != "raw/shared.md" {
+		t.Errorf("expected alpha.Sources [raw/shared.md] preserved, got %v", alpha.Sources)
+	}
+	beta := mf.Concepts["beta"]
+	if len(beta.Sources) != 2 {
+		t.Errorf("expected beta.Sources unchanged (2), got %v", beta.Sources)
+	}
+	entry, err := memStore.Get("raw/shared.md")
+	if err != nil || entry == nil {
+		t.Errorf("expected memStore entry preserved, got entry=%v err=%v", entry, err)
+	}
+	vec, err := vecStore.Get("raw/shared.md")
+	if err != nil || vec == nil {
+		t.Errorf("expected vecStore entry preserved, got vec=%v err=%v", vec, err)
+	}
+}
+
+func TestHandleRemovedSources_PurelyMultiSource_NoPrune(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := storage.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	memStore := memory.NewStore(db)
+	vecStore := vectors.NewStore(db)
+	ontStore := ontology.NewStore(db, nil, nil)
+
+	memStore.Add(memory.Entry{ID: "raw/gone.md", Content: "gone source", Tags: []string{"source"}})
+	vecStore.Upsert("raw/gone.md", []float32{0.4, 0.5, 0.6})
+
+	mf := manifest.New()
+	mf.AddSource("raw/gone.md", "sha256:ccc", "article", 1000)
+	mf.AddSource("raw/kept.md", "sha256:ddd", "article", 1000)
+	mf.AddConcept("gamma", "wiki/concepts/gamma.md", []string{"raw/gone.md", "raw/kept.md"})
+
+	handleRemovedSources(dir, []string{"raw/gone.md"}, mf, memStore, vecStore, ontStore, false)
+
+	// No orphans → today's behavior preserved: concept.Sources updated, source removed
+	gamma := mf.Concepts["gamma"]
+	if len(gamma.Sources) != 1 || gamma.Sources[0] != "raw/kept.md" {
+		t.Errorf("expected gamma.Sources [raw/kept.md], got %v", gamma.Sources)
+	}
+	if mf.SourceCount() != 1 {
+		t.Errorf("expected 1 source remaining, got %d", mf.SourceCount())
+	}
+	entry, _ := memStore.Get("raw/gone.md")
+	if entry != nil {
+		t.Errorf("expected memStore entry cleaned, got %v", entry)
+	}
+	vec, _ := vecStore.Get("raw/gone.md")
+	if vec != nil {
+		t.Errorf("expected vecStore entry cleaned, got %v", vec)
 	}
 }
 

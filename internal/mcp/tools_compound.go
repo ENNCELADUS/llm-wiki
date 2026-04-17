@@ -17,6 +17,7 @@ func (s *Server) registerCompoundTools() {
 			mcplib.WithDescription("Run the full compile pipeline: diff → summarize → extract concepts → write articles."),
 			mcplib.WithBoolean("dry_run", mcplib.Description("Show what would change without writing")),
 			mcplib.WithBoolean("fresh", mcplib.Description("Ignore checkpoint, clean compile")),
+			mcplib.WithBoolean("prune", mcplib.Description("Remove orphaned articles whose sole source was deleted")),
 		),
 		s.handleCompile,
 	)
@@ -35,10 +36,12 @@ func (s *Server) handleCompile(ctx context.Context, req mcplib.CallToolRequest) 
 	args := req.GetArguments()
 	dryRun, _ := args["dry_run"].(bool)
 	fresh, _ := args["fresh"].(bool)
+	prune, _ := args["prune"].(bool)
 
 	result, err := compiler.Compile(s.projectDir, compiler.CompileOpts{
 		DryRun: dryRun,
 		Fresh:  fresh,
+		Prune:  prune,
 	})
 	if err != nil {
 		return errorResult(fmt.Sprintf("compile failed: %v", err)), nil

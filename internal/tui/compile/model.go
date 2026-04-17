@@ -70,6 +70,7 @@ type Model struct {
 	outputDir   string
 	sourcePaths []string // source directories to watch
 	debounce    int
+	compileOpts compiler.CompileOpts
 }
 
 // New creates a compile dashboard model.
@@ -308,7 +309,7 @@ func (m Model) statusInfo() string {
 func (m Model) runCompile() tea.Cmd {
 	m.compiling = true
 	return func() tea.Msg {
-		result, err := compiler.Compile(m.projectDir, compiler.CompileOpts{})
+		result, err := compiler.Compile(m.projectDir, m.compileOpts)
 		var costLine string
 		if result != nil && result.CostReport != nil {
 			costLine = fmt.Sprintf("~$%.4f", result.CostReport.EstimatedCost)

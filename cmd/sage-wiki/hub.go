@@ -67,6 +67,7 @@ func init() {
 	hubSearchCmd.Flags().Int("limit", 10, "Maximum results")
 
 	hubCompileCmd.Flags().Bool("all", false, "Compile all projects")
+	hubCompileCmd.Flags().Bool("prune", false, "Remove orphaned articles whose sole source was deleted")
 
 	hubCmd.AddCommand(hubInitCmd, hubAddCmd, hubRemoveCmd, hubListCmd, hubSearchCmd, hubStatusCmd, hubCompileCmd)
 }
@@ -314,6 +315,7 @@ func runHubStatus(cmd *cobra.Command, args []string) error {
 
 func runHubCompile(cmd *cobra.Command, args []string) error {
 	all, _ := cmd.Flags().GetBool("all")
+	prune, _ := cmd.Flags().GetBool("prune")
 
 	hubCfg, err := loadHub()
 	if err != nil {
@@ -357,7 +359,7 @@ func runHubCompile(cmd *cobra.Command, args []string) error {
 	var results []compileResult
 	for name, p := range targets {
 		fmt.Fprintf(cmd.ErrOrStderr(), "Compiling %s...\n", name)
-		result, err := compiler.Compile(p.Path, compiler.CompileOpts{})
+		result, err := compiler.Compile(p.Path, compiler.CompileOpts{Prune: prune})
 		if err != nil {
 			results = append(results, compileResult{Name: name, Error: err.Error()})
 			continue
