@@ -188,10 +188,13 @@ sources:
 output: wiki
 
 # LLM provider configuration
-# Supported: anthropic, openai, gemini, ollama, openai-compatible
+# Supported: anthropic, openai, gemini, ollama, openai-compatible, qwen
 # For OpenRouter or other OpenAI-compatible providers, set:
 #   provider: openai-compatible
 #   base_url: https://openrouter.ai/api/v1
+# For Alibaba Cloud DashScope Qwen, set:
+#   provider: qwen
+#   api_key: ${DASHSCOPE_API_KEY}
 api:
   provider: gemini
   api_key: ${GEMINI_API_KEY}
@@ -222,6 +225,10 @@ compiler:
   article_max_tokens: 4000
   auto_commit: true
   auto_lint: true
+  # timezone: Asia/Shanghai   # IANA timezone for user-facing timestamps (default: UTC)
+  # article_fields:           # custom frontmatter fields extracted from LLM response
+  #   - language
+  #   - domain
 
 search:
   hybrid_weight_bm25: 0.7
@@ -231,6 +238,25 @@ search:
 serve:
   transport: stdio      # stdio or sse
   port: 3333            # SSE mode only
+
+# Ontology types (optional)
+# Extend built-in types with additional synonyms or add custom types.
+#
+# Built-in relation types: implements, extends, optimizes, contradicts, cites,
+#                          prerequisite_of, trades_off, derived_from
+# Built-in entity types: concept, technique, source, claim, artifact
+#
+# ontology:
+#   relation_types:
+#     - name: implements
+#       synonyms: ["thực hiện", "triển khai"]   # add Vietnamese synonyms
+#     - name: regulates
+#       synonyms: ["regulates", "regulated by", "调控", "调节"]
+#   entity_types:
+#     - name: conversation
+#       description: "A dialogue or discussion"
+#     - name: decision
+#       description: "A recorded decision with rationale"
 `, project, description, model, model, model, model, model)
 }
 
@@ -252,10 +278,13 @@ output: %s
 ignore:
 %s
 # LLM provider configuration
-# Supported: anthropic, openai, gemini, ollama, openai-compatible
+# Supported: anthropic, openai, gemini, ollama, openai-compatible, qwen
 # For OpenRouter or other OpenAI-compatible providers, set:
 #   provider: openai-compatible
 #   base_url: https://openrouter.ai/api/v1
+# For Alibaba Cloud DashScope Qwen, set:
+#   provider: qwen
+#   api_key: ${DASHSCOPE_API_KEY}
 api:
   provider: gemini
   api_key: ${GEMINI_API_KEY}
@@ -287,5 +316,16 @@ search:
 
 serve:
   transport: stdio
+
+# Ontology types (optional)
+# ontology:
+#   relation_types:
+#     - name: implements
+#       synonyms: ["thực hiện", "triển khai"]
+#     - name: regulates
+#       synonyms: ["regulates", "regulated by"]
+#   entity_types:
+#     - name: conversation
+#     - name: decision
 `, project, project, sourcesYAML, output, ignoreYAML, model, model, model, model, model)
 }

@@ -1,3 +1,5 @@
+**English** | [中文](README_zh.md)
+
 # sage-wiki
 
 An implementation of [Andrej Karpathy's idea](https://x.com/karpathy/status/2039805659525644595) for an LLM-compiled personal knowledge base. Developed using [Sage Framework](https://github.com/xoai/sage).
@@ -7,13 +9,15 @@ Some lessons learned after building sage-wiki [here](https://x.com/xoai/status/2
 Drop in your papers, articles, and notes. sage-wiki compiles them into a structured, interlinked wiki — with concepts extracted, cross-references discovered, and everything searchable.
 
 - **Your sources in, a wiki out.** Add documents to a folder. The LLM reads, summarizes, extracts concepts, and writes interconnected articles.
+- **Scales to 100K+ documents.** Tiered compilation indexes everything fast, compiles only what matters. A 100K vault is searchable in hours, not months.
 - **Compounding knowledge.** Every new source enriches existing articles. The wiki gets smarter as it grows.
 - **Works with your tools.** Opens natively in Obsidian. Connects to any LLM agent via MCP. Runs as a single binary — nothing to install beyond the API key.
-- **Ask your wiki questions.** Search across everything with hybrid BM25 + semantic search, or ask natural language questions and get cited answers.
+- **Ask your wiki questions.** Enhanced search with chunk-level indexing, LLM query expansion, and re-ranking. Ask natural language questions and get cited answers.
+- **Compile on demand.** Agents can trigger compilation for specific topics via MCP. Search results signal when uncompiled sources are available.
 
 https://github.com/user-attachments/assets/c35ee202-e9df-4ccd-b520-8f057163ff26
 
-*Dots on the outer boundary represent summaries of all documents in the knowledge base, while dots in the inner circle represent concepts extracted from the knowledge base, with links showing how those concepts connect to one another.*
+_Dots on the outer boundary represent summaries of all documents in the knowledge base, while dots in the inner circle represent concepts extracted from the knowledge base, with links showing how those concepts connect to one another._
 
 ## Install
 
@@ -29,20 +33,20 @@ go build -tags webui -o sage-wiki ./cmd/sage-wiki/
 
 ## Supported Source Formats
 
-| Format | Extensions | What gets extracted |
-|--------|-----------|-------------------|
-| Markdown | `.md` | Body text with frontmatter parsed separately |
-| PDF | `.pdf` | Full text via pure-Go extraction |
-| Word | `.docx` | Document text from XML |
-| Excel | `.xlsx` | Cell values and sheet data |
-| PowerPoint | `.pptx` | Slide text content |
-| CSV | `.csv` | Headers + rows (up to 1000 rows) |
-| EPUB | `.epub` | Chapter text from XHTML |
-| Email | `.eml` | Headers (from/to/subject/date) + body |
-| Plain text | `.txt`, `.log` | Raw content |
-| Transcripts | `.vtt`, `.srt` | Raw content |
-| Images | `.png`, `.jpg`, `.gif`, `.webp`, `.svg` | Description via vision LLM (caption, content, visible text) |
-| Code | `.go`, `.py`, `.js`, `.ts`, `.rs`, etc. | Source code |
+| Format      | Extensions                              | What gets extracted                                         |
+| ----------- | --------------------------------------- | ----------------------------------------------------------- |
+| Markdown    | `.md`                                   | Body text with frontmatter parsed separately                |
+| PDF         | `.pdf`                                  | Full text via pure-Go extraction                            |
+| Word        | `.docx`                                 | Document text from XML                                      |
+| Excel       | `.xlsx`                                 | Cell values and sheet data                                  |
+| PowerPoint  | `.pptx`                                 | Slide text content                                          |
+| CSV         | `.csv`                                  | Headers + rows (up to 1000 rows)                            |
+| EPUB        | `.epub`                                 | Chapter text from XHTML                                     |
+| Email       | `.eml`                                  | Headers (from/to/subject/date) + body                       |
+| Plain text  | `.txt`, `.log`                          | Raw content                                                 |
+| Transcripts | `.vtt`, `.srt`                          | Raw content                                                 |
+| Images      | `.png`, `.jpg`, `.gif`, `.webp`, `.svg` | Description via vision LLM (caption, content, visible text) |
+| Code        | `.go`, `.py`, `.js`, `.ts`, `.rs`, etc. | Source code                                                 |
 
 Just drop files into your source folder — sage-wiki detects the format automatically. Images require a vision-capable LLM (Gemini, Claude, GPT-4o).
 
@@ -85,21 +89,53 @@ sage-wiki compile
 sage-wiki compile --watch
 ```
 
+### Docker
+
+```bash
+# Pull from GitHub Container Registry
+docker pull ghcr.io/xoai/sage-wiki:latest
+
+# Or from Docker Hub
+docker pull xoai/sage-wiki:latest
+
+# Run with your wiki directory mounted
+docker run -d -p 3333:3333 -v ./my-wiki:/wiki -e GEMINI_API_KEY=... ghcr.io/xoai/sage-wiki
+
+# Or build from source
+docker build -t sage-wiki .
+docker run -d -p 3333:3333 -v ./my-wiki:/wiki -e GEMINI_API_KEY=... sage-wiki
+```
+
+Available tags: `:latest` (main branch), `:v1.0.0` (releases), `:sha-abc1234` (specific commits). Multi-arch: `linux/amd64` and `linux/arm64`.
+
+See the [self-hosting guide](docs/guides/self-hosted-server.md) for Docker Compose, Syncthing sync, reverse proxy, and LLM provider setup.
+
 ## Commands
 
-| Command | Description |
-|---------|------------|
-| `sage-wiki init [--vault]` | Initialize project (greenfield or vault overlay) |
-| `sage-wiki compile [--watch] [--dry-run]` | Compile sources into wiki articles |
-| `sage-wiki serve [--transport stdio\|sse]` | Start MCP server for LLM agents |
-| `sage-wiki serve --ui [--port 3333]` | Start web UI (requires `-tags webui` build) |
-| `sage-wiki lint [--fix] [--pass name]` | Run linting passes |
-| `sage-wiki search "query" [--tags ...]` | Hybrid search (BM25 + vector) |
-| `sage-wiki query "question"` | Q&A against the wiki |
-| `sage-wiki tui` | Launch interactive terminal dashboard |
-| `sage-wiki ingest <url\|path>` | Add a source |
-| `sage-wiki status` | Wiki stats and health |
-| `sage-wiki doctor` | Validate config and connectivity |
+| Command                                                                                 | Description                                      |
+| --------------------------------------------------------------------------------------- | ------------------------------------------------ |
+| `sage-wiki init [--vault] [--skill <agent>]`                                            | Initialize project (greenfield or vault overlay) |
+| `sage-wiki compile [--watch] [--dry-run] [--batch] [--estimate] [--no-cache] [--prune]` | Compile sources into wiki articles               |
+| `sage-wiki serve [--transport stdio\|sse]`                                              | Start MCP server for LLM agents                  |
+| `sage-wiki serve --ui [--port 3333]`                                                    | Start web UI (requires `-tags webui` build)      |
+| `sage-wiki lint [--fix] [--pass name]`                                                  | Run linting passes                               |
+| `sage-wiki search "query" [--tags ...]`                                                 | Hybrid search (BM25 + vector)                    |
+| `sage-wiki query "question"`                                                            | Q&A against the wiki                             |
+| `sage-wiki tui`                                                                         | Launch interactive terminal dashboard            |
+| `sage-wiki ingest <url\|path>`                                                          | Add a source                                     |
+| `sage-wiki status`                                                                      | Wiki stats and health                            |
+| `sage-wiki provenance <source-or-concept>`                                              | Show source↔article provenance mappings          |
+| `sage-wiki doctor`                                                                      | Validate config and connectivity                 |
+| `sage-wiki diff`                                                                        | Show pending source changes against manifest     |
+| `sage-wiki list`                                                                        | List wiki entities, concepts, or sources         |
+| `sage-wiki write <summary\|article>`                                                    | Write a summary or article                       |
+| `sage-wiki ontology <query\|list\|add>`                                                 | Query, list, and manage the ontology graph       |
+| `sage-wiki hub <add\|remove\|search\|status\|list>`                                    | Multi-project hub commands                       |
+| `sage-wiki learn "text"`                                                                | Store a learning entry                           |
+| `sage-wiki capture "text"`                                                              | Capture knowledge from text                      |
+| `sage-wiki add-source <path>`                                                           | Register a source file in the manifest           |
+| `sage-wiki skill <refresh\|preview> [--target <agent>]`                                 | Generate or refresh agent skill files            |
+| `sage-wiki scribe <session-file>`                                                       | Extract entities from a session transcript       |
 
 ## TUI
 
@@ -128,6 +164,7 @@ sage-wiki serve --ui
 ```
 
 Features:
+
 - **Article browser** with rendered markdown, syntax highlighting, and clickable `[[wikilinks]]`
 - **Hybrid search** with ranked results and snippets
 - **Knowledge graph** — interactive force-directed visualization of concepts and their connections
@@ -139,6 +176,7 @@ Features:
 The web UI is built with Preact + Tailwind CSS and embedded into the Go binary via `go:embed`. It adds ~1.2 MB (gzipped) to the binary size. To build without the web UI, omit the `-tags webui` flag — the binary will still work for all CLI and MCP operations.
 
 Options:
+
 - `--port 3333` — change the port (default 3333)
 - `--bind 0.0.0.0` — expose on the network (default localhost only, no auth)
 
@@ -153,11 +191,11 @@ description: "Personal research wiki"
 
 # Source folders to watch and compile
 sources:
-  - path: raw               # or vault folders like Clippings/, Papers/
-    type: auto               # auto-detect from file extension
+  - path: raw # or vault folders like Clippings/, Papers/
+    type: auto # auto-detect from file extension
     watch: true
 
-output: wiki                 # compiled output directory (_wiki for vault overlay)
+output: wiki # compiled output directory (_wiki for vault overlay)
 
 # Folders to never read or send to APIs (vault overlay mode)
 # ignore:
@@ -165,15 +203,21 @@ output: wiki                 # compiled output directory (_wiki for vault overla
 #   - Personal
 
 # LLM provider
-# Supported: anthropic, openai, gemini, ollama, openai-compatible
+# Supported: anthropic, openai, gemini, ollama, openai-compatible, qwen
 # For OpenRouter or other OpenAI-compatible providers:
 #   provider: openai-compatible
 #   base_url: https://openrouter.ai/api/v1
+# For Alibaba Cloud DashScope Qwen:
+#   provider: qwen
+#   api_key: ${DASHSCOPE_API_KEY}
 api:
   provider: gemini
-  api_key: ${GEMINI_API_KEY}    # env var expansion supported
+  api_key: ${GEMINI_API_KEY} # env var expansion supported
   # base_url:                   # custom endpoint (OpenRouter, Azure, etc.)
   # rate_limit: 60              # requests per minute
+  # extra_params:               # provider-specific params merged into request body
+  #   enable_thinking: false    # e.g., disable Qwen thinking mode
+  #   reasoning_effort: low     # e.g., DeepSeek reasoning control
 
 # Model per task — use cheaper models for high-volume, quality for writing
 models:
@@ -186,28 +230,154 @@ models:
 # Embedding provider (optional — auto-detected from api provider)
 # Override to use a different provider for embeddings
 embed:
-  provider: auto              # auto, openai, gemini, ollama, voyage, mistral
+  provider: auto # auto, openai, gemini, ollama, voyage, mistral
   # model: text-embedding-3-small
   # api_key: ${OPENAI_API_KEY}  # separate key for embeddings
   # base_url:                   # separate endpoint
 
 compiler:
-  max_parallel: 4             # concurrent LLM calls
-  debounce_seconds: 2         # watch mode debounce
+  max_parallel: 20 # concurrent LLM calls (with adaptive backpressure)
+  debounce_seconds: 2 # watch mode debounce
   summary_max_tokens: 2000
   article_max_tokens: 4000
-  auto_commit: true           # git commit after compile
-  auto_lint: true             # run lint after compile
+  auto_commit: true # git commit after compile
+  auto_lint: true # run lint after compile
+  mode: auto # standard, batch, or auto (auto = batch when 10+ sources)
+  # estimate_before: false    # prompt with cost estimate before compiling
+  # prompt_cache: true        # enable prompt caching (default: true)
+  # batch_threshold: 10       # min sources for auto-batch mode
+  # token_price_per_million: 0  # override pricing (0 = use built-in)
+  # timezone: Asia/Shanghai   # IANA timezone for user-facing timestamps (default: UTC)
+  # article_fields:           # custom frontmatter fields extracted from LLM response
+  #   - language
+  #   - domain
+
+  # Tiered compilation — index fast, compile what matters
+  default_tier: 3 # 0=index, 1=index+embed, 3=full compile
+  # tier_defaults:             # per-extension tier overrides
+  #   json: 0                  # structured data — index only
+  #   yaml: 0
+  #   lock: 0
+  #   md: 1                    # prose — index + embed
+  #   go: 1                    # code — index + embed + parse
+  # auto_promote: true         # promote to tier 3 based on query hits
+  # auto_demote: true          # demote stale articles
+  # split_threshold: 15000     # chars — split large docs for faster writing
+  # dedup_threshold: 0.85      # cosine similarity for concept dedup
+  # backpressure: true         # adaptive concurrency on rate limits
 
 search:
-  hybrid_weight_bm25: 0.7    # BM25 vs vector weight
+  hybrid_weight_bm25: 0.7 # BM25 vs vector weight
   hybrid_weight_vector: 0.3
   default_limit: 10
+  # query_expansion: true     # LLM query expansion for Q&A (default: true)
+  # rerank: true              # LLM re-ranking for Q&A (default: true)
+  # chunk_size: 800           # tokens per chunk for indexing (100-5000)
+  # graph_expansion: true     # graph-based context expansion for Q&A (default: true)
+  # graph_max_expand: 10      # max articles added via graph expansion
+  # graph_depth: 2            # ontology traversal depth (1-5)
+  # context_max_tokens: 8000  # token budget for query context
+  # weight_direct_link: 3.0   # graph signal: ontology relation between concepts
+  # weight_source_overlap: 4.0 # graph signal: shared source documents
+  # weight_common_neighbor: 1.5 # graph signal: Adamic-Adar common neighbors
+  # weight_type_affinity: 1.0  # graph signal: entity type pair bonus
 
 serve:
-  transport: stdio            # stdio or sse
-  port: 3333                  # SSE mode only
+  transport: stdio # stdio or sse
+  port: 3333 # SSE mode only
+
+
+# Ontology types (optional)
+# Extend built-in types with additional synonyms or add custom types.
+# ontology:
+#   relation_types:
+#     - name: implements           # extend built-in with more synonyms
+#       synonyms: ["thực hiện", "triển khai"]
+#     - name: regulates            # add a custom relation type
+#       synonyms: ["regulates", "regulated by", "调控"]
+#   entity_types:
+#     - name: decision
+#       description: "A recorded decision with rationale"
 ```
+
+### Configurable Relations
+
+The ontology has 8 built-in relation types: `implements`, `extends`, `optimizes`, `contradicts`, `cites`, `prerequisite_of`, `trades_off`, `derived_from`. Each has default keyword synonyms used for automatic extraction.
+
+You can customize relations via `ontology.relations` in `config.yaml`:
+
+- **Extend a built-in type** — add synonyms (e.g., multilingual keywords) to an existing type. The default synonyms are kept; yours are appended.
+- **Add a custom type** — define a new relation name with its keyword synonyms. Relation names must be lowercase `[a-z][a-z0-9_]*`.
+
+Zero config = identical to current behavior. Existing databases are migrated automatically on first open. See the [full guide](docs/guides/configurable-relations.md) for domain-specific examples, built-in synonym tables, and how extraction works.
+
+## Cost Optimization
+
+sage-wiki tracks token usage and estimates cost for every compile. Three strategies to reduce cost:
+
+**Prompt caching** (default: on) — Reuses system prompts across LLM calls within a compile pass. Anthropic and Gemini cache explicitly; OpenAI caches automatically. Saves 50-90% on input tokens.
+
+**Batch API** — Submit all sources as a single async batch for 50% cost reduction. Available for Anthropic and OpenAI.
+
+```bash
+sage-wiki compile --batch       # submit batch, checkpoint, exit
+sage-wiki compile               # poll status, retrieve when done
+```
+
+**Cost estimation** — Preview cost before committing:
+
+```bash
+sage-wiki compile --estimate    # show cost breakdown, exit
+```
+
+Or set `compiler.estimate_before: true` in config to prompt every time.
+
+**Auto mode** — Set `compiler.mode: auto` and `compiler.batch_threshold: 10` to automatically use batch when compiling 10+ sources.
+
+## Scaling to Large Vaults
+
+sage-wiki uses **tiered compilation** to handle vaults of 10K-100K+ documents. Instead of compiling everything through the full LLM pipeline, sources are routed through tiers based on file type and usage:
+
+| Tier | What happens | Cost | Time per doc |
+|------|-------------|------|-------------|
+| **0** — Index only | FTS5 full-text search | Free | ~5ms |
+| **1** — Index + embed | FTS5 + vector embedding | ~$0.00002 | ~200ms |
+| **2** — Code parse | Structural summary via regex parser (no LLM) | Free | ~10ms |
+| **3** — Full compile | Summarize + extract concepts + write articles | ~$0.05-0.15 | ~5-8 min |
+
+By default (`default_tier: 3`), all sources go through the full LLM pipeline — the same behavior as before tiered compilation. For large vaults (10K+), set `default_tier: 1` to index everything in ~5.5 hours, then compile on demand — when an agent queries a topic, search signals uncompiled sources, and `wiki_compile_topic` compiles just that cluster (~2 min for 20 sources).
+
+**Key features:**
+- **File-type defaults** — JSON, YAML, and lock files skip to Tier 0 automatically. Configure per-extension via `tier_defaults`.
+- **Auto-promotion** — Sources promote to Tier 3 after 3+ search hits or when a topic cluster reaches 5+ sources.
+- **Auto-demotion** — Stale articles (90 days without queries) demote to Tier 1 for recompilation on next access.
+- **Adaptive backpressure** — Concurrency self-tunes to your provider's rate limits. Starts at 20 parallel, halves on 429s, recovers automatically.
+- **10 code parsers** — Go (via go/ast), TypeScript, JavaScript, Python, Rust, Java, C, C++, Ruby, plus JSON/YAML/TOML key extraction. Code gets structural summaries without LLM calls.
+- **Compile-on-demand** — `wiki_compile_topic("flash attention")` via MCP compiles relevant sources in real time.
+- **Quality scoring** — Per-article source coverage, extraction completeness, and cross-reference density tracked automatically.
+
+See the [full scaling guide](docs/guides/large-vault-performance.md) for configuration, tier override examples, and performance targets.
+
+## Search Quality
+
+sage-wiki uses an enhanced search pipeline for Q&A queries, inspired by analyzing [qmd](https://github.com/dmayboroda/qmd)'s retrieval approach:
+
+- **Chunk-level indexing** — Articles are split into ~800-token chunks, each with its own FTS5 entry and vector embedding. A search for "flash attention" finds the relevant paragraph inside a 3000-token Transformer article.
+- **LLM query expansion** — A single LLM call generates keyword rewrites (for BM25), semantic rewrites (for vector search), and a hypothetical answer (for embedding similarity). A strong-signal check skips expansion when the top BM25 result is already confident.
+- **LLM re-ranking** — Top 15 candidates are scored by the LLM for relevance. Position-aware blending protects high-confidence retrieval results (ranks 1-3 get 75% retrieval weight, ranks 11+ get 60% reranker weight).
+- **BM25-prefiltered vector search** — Vector comparisons are limited to chunks from BM25 candidate documents, capping cosine computations at ~250 regardless of wiki size.
+- **Graph-enhanced context expansion** — After retrieval, a 4-signal graph scorer finds related articles via the ontology: direct relations (×3.0), shared source documents (×4.0), common neighbors via Adamic-Adar (×1.5), and entity type affinity (×1.0). This surfaces articles that are structurally related but missed by keyword/vector search.
+- **Token budget control** — Query context is capped at a configurable token limit (default 8000), with articles truncated at 4000 tokens each. Greedy filling prioritizes the highest-scored articles.
+
+|                 | sage-wiki                                  | qmd               |
+| --------------- | ------------------------------------------ | ----------------- |
+| Chunk search    | FTS5 + vector (dual-channel)               | Vector-only       |
+| Query expansion | LLM-based (lex/vec/hyde)                   | LLM-based         |
+| Re-ranking      | LLM + position-aware blending              | Cross-encoder     |
+| Graph context   | 4-signal graph expansion + 1-hop traversal | No graph          |
+| Cost per query  | Free (Ollama) / ~$0.0006 (cloud)           | Free (local GGUF) |
+
+Zero config = all features enabled. With Ollama or other local models, enhanced search is completely free — re-ranking is auto-disabled (local models struggle with structured JSON scoring) but chunk-level search and query expansion still work. With cloud LLMs, the additional cost is negligible (~$0.0006/query). Both expansion and re-ranking can be toggled via config. See the [full search quality guide](docs/guides/search-quality.md) for configuration, cost breakdown, and detailed comparison.
 
 ## Customizing Prompts
 
@@ -229,6 +399,73 @@ prompts/
 ```
 
 Edit any file to change how sage-wiki processes that type. Add new source types by creating `summarize-{type}.md` (e.g., `summarize-dataset.md`). Delete a file to revert to the built-in default.
+
+### Custom Frontmatter Fields
+
+Article frontmatter is built from two sources: **ground-truth data** (concept name, aliases, sources, timestamp) is always generated by code, while **semantic fields** are assessed by the LLM.
+
+By default, `confidence` is the only LLM-assessed field. To add custom fields:
+
+1. Declare them in `config.yaml`:
+
+```yaml
+compiler:
+  article_fields:
+    - language
+    - domain
+```
+
+2. Update your `prompts/write-article.md` template to ask the LLM for these fields:
+
+```
+At the end of your response, state:
+Language: (the primary language of the concept)
+Domain: (the academic field, e.g., machine learning, biology)
+Confidence: high, medium, or low
+```
+
+The LLM's responses are extracted from the article body and merged into the YAML frontmatter automatically. The resulting frontmatter looks like:
+
+```yaml
+---
+concept: self-attention
+aliases: ["scaled dot-product attention"]
+sources: ["raw/transformer-paper.md"]
+confidence: high
+language: English
+domain: machine learning
+created_at: 2026-04-10T08:00:00+08:00
+---
+```
+
+Ground-truth fields (`concept`, `aliases`, `sources`, `created_at`) are always accurate — they come from the extraction pass, not the LLM. Semantic fields (`confidence` + your custom fields) reflect the LLM's judgment.
+
+## Agent Skill Files
+
+sage-wiki has 17 MCP tools, but agents won't use them unless something in their context says *when* to check the wiki. Skill files bridge that gap — generated snippets that teach agents when to search, what to capture, and how to query effectively.
+
+```bash
+# Generate during project init
+sage-wiki init --skill claude-code
+
+# Or add to an existing project
+sage-wiki skill refresh --target claude-code
+
+# Preview without writing
+sage-wiki skill preview --target cursor
+```
+
+This appends a behavioral skill section to the agent's instruction file (CLAUDE.md, .cursorrules, etc.) with project-specific triggers, capture guidelines, and query examples derived from your config.yaml.
+
+**Supported agents:** `claude-code`, `cursor`, `windsurf`, `agents-md` (Antigravity/Codex), `gemini`, `generic`
+
+**Domain packs:** The generator auto-selects a pack based on your source types:
+- `codebase-memory` — code projects (default). Triggers on API changes, refactors, breaking changes.
+- `research-library` — paper/article projects. Triggers on domain questions, related work.
+- `meeting-notes` — operational use (override only: `--pack meeting-notes`).
+- `documentation-curator` — documentation projects (override only: `--pack documentation-curator`).
+
+Running `skill refresh` regenerates only the marked skill section — your other content is preserved.
 
 ## MCP Integration
 
@@ -255,6 +492,20 @@ Add to `.mcp.json`:
 sage-wiki serve --transport sse --port 3333
 ```
 
+## Knowledge Capture from AI Conversations
+
+sage-wiki runs as an MCP server, so you can capture knowledge directly from your AI conversations. Connect it to Claude Code, ChatGPT, Cursor, or any MCP client — then just ask:
+
+> "Save what we just figured out about connection pooling to my wiki"
+
+> "Capture the key decisions from this debugging session"
+
+The `wiki_capture` tool extracts knowledge items (decisions, discoveries, corrections) from conversation text via your LLM, writes them as source files, and queues them for compilation. Noise (greetings, retries, dead ends) is filtered out automatically.
+
+For single facts, `wiki_learn` stores a nugget directly. For full documents, `wiki_add_source` ingests a file. Run `wiki_compile` to process everything into articles.
+
+See the full setup guide: [Agent Memory Layer Guide](docs/guides/agent-memory-layer.md)
+
 ## Benchmarks
 
 Evaluated on a real wiki compiled from 1,107 sources (49.4 MB database, 2,832 wiki files).
@@ -263,29 +514,29 @@ Run `python3 eval.py .` on your own project to reproduce. See [eval.py](eval.py)
 
 ### Performance
 
-| Operation | p50 | Throughput |
-|---|--:|--:|
-| FTS5 keyword search (top-10) | 411µs | 1,775 qps |
-| Vector cosine search (2,858 × 3072d) | 81ms | 15 qps |
-| Hybrid RRF (BM25 + vector) | 80ms | 16 qps |
-| Graph traversal (BFS depth ≤ 5) | 1µs | 738K qps |
-| Cycle detection (full graph) | 1.4ms | — |
-| FTS insert (batch 100) | — | 89,802 /s |
-| Sustained mixed reads | 77µs | 8,500+ ops/s |
+| Operation                            |   p50 |   Throughput |
+| ------------------------------------ | ----: | -----------: |
+| FTS5 keyword search (top-10)         | 411µs |    1,775 qps |
+| Vector cosine search (2,858 × 3072d) |  81ms |       15 qps |
+| Hybrid RRF (BM25 + vector)           |  80ms |       16 qps |
+| Graph traversal (BFS depth ≤ 5)      |   1µs |     738K qps |
+| Cycle detection (full graph)         | 1.4ms |            — |
+| FTS insert (batch 100)               |     — |    89,802 /s |
+| Sustained mixed reads                |  77µs | 8,500+ ops/s |
 
 Non-LLM compile overhead (hashing + dependency analysis) is under 1 second. The compiler's wall time is dominated entirely by LLM API calls.
 
 ### Quality
 
-| Metric | Score |
-|---|--:|
-| Search recall@10 | **100%** |
-| Search recall@1 | 91.6% |
-| Source citation rate | 94.6% |
-| Alias coverage | 90.0% |
-| Fact extraction rate | 68.5% |
-| Wiki connectivity | 60.5% |
-| Cross-reference integrity | 50.0% |
+| Metric                    |     Score |
+| ------------------------- | --------: |
+| Search recall@10          |  **100%** |
+| Search recall@1           |     91.6% |
+| Source citation rate      |     94.6% |
+| Alias coverage            |     90.0% |
+| Fact extraction rate      |     68.5% |
+| Wiki connectivity         |     60.5% |
+| Cross-reference integrity |     50.0% |
 | **Overall quality score** | **73.0%** |
 
 ### Running the eval
@@ -323,13 +574,14 @@ python3 eval.py ./test-fixture
 
 ![Sage-Wiki Architecture](sage-wiki-architecture.png)
 
-- **Storage:** SQLite with FTS5 (BM25 search) + BLOB vectors (cosine similarity)
+- **Storage:** SQLite with FTS5 (BM25 search) + BLOB vectors (cosine similarity) + compile_items table for per-source tier/state tracking
 - **Ontology:** Typed entity-relation graph with BFS traversal and cycle detection
-- **Search:** Reciprocal Rank Fusion (RRF) combining BM25 + vector + tag boost + recency decay
-- **Compiler:** 5-pass pipeline (diff, summarize, extract concepts, write articles, images)
-- **MCP:** 14 tools (5 read, 7 write, 2 compound) via stdio or SSE
-- **TUI:** bubbletea + glamour 4-tab terminal dashboard (browse, search, Q&A, compile)
+- **Search:** Enhanced pipeline with chunk-level FTS5 + vector indexing, LLM query expansion, LLM re-ranking, RRF fusion, and 4-signal graph expansion. Search responses signal uncompiled sources for compile-on-demand.
+- **Compiler:** Tiered pipeline (Tier 0: index, Tier 1: embed, Tier 2: code parse, Tier 3: full LLM compile) with adaptive backpressure, prompt caching, batch API, cost tracking, compile-on-demand via MCP, quality scoring, and cascade awareness. 10 built-in code parsers (Go via go/ast, 8 languages via regex, structured data key extraction).
+- **MCP:** 17 tools (6 read, 9 write, 2 compound) via stdio or SSE, including `wiki_compile_topic` for on-demand compilation and `wiki_capture` for knowledge extraction
+- **TUI:** bubbletea + glamour 4-tab terminal dashboard (browse, search, Q&A, compile) with tier distribution display
 - **Web UI:** Preact + Tailwind CSS embedded via `go:embed` with build tag (`-tags webui`)
+- **Scribe:** Extensible interface for ingesting knowledge from conversations. Session scribe processes Claude Code JSONL transcripts.
 
 Zero CGO. Pure Go. Cross-platform.
 

@@ -10,6 +10,7 @@ import (
 	"github.com/xoai/sage-wiki/internal/llm"
 	"github.com/xoai/sage-wiki/internal/log"
 	"github.com/xoai/sage-wiki/internal/manifest"
+	"github.com/xoai/sage-wiki/internal/prompts"
 	"github.com/xoai/sage-wiki/internal/memory"
 	"github.com/xoai/sage-wiki/internal/ontology"
 	"github.com/xoai/sage-wiki/internal/storage"
@@ -24,6 +25,11 @@ func ReExtract(projectDir string) (*CompileResult, error) {
 	cfg, err := config.Load(filepath.Join(projectDir, "config.yaml"))
 	if err != nil {
 		return nil, fmt.Errorf("re-extract: load config: %w", err)
+	}
+
+	// Load user prompt overrides if prompts/ directory exists
+	if err := prompts.LoadFromDir(filepath.Join(projectDir, "prompts")); err != nil {
+		log.Warn("failed to load custom prompts", "error", err)
 	}
 
 	mf, err := manifest.Load(filepath.Join(projectDir, ".manifest.json"))
@@ -61,7 +67,7 @@ func ReExtract(projectDir string) (*CompileResult, error) {
 	}
 
 	// Create LLM client
-	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit)
+	client, err := llm.NewClient(cfg.API.Provider, cfg.API.APIKey, cfg.API.BaseURL, cfg.API.RateLimit, cfg.API.ExtraParams)
 	if err != nil {
 		return nil, fmt.Errorf("re-extract: create LLM client: %w", err)
 	}
@@ -75,8 +81,11 @@ func ReExtract(projectDir string) (*CompileResult, error) {
 
 	memStore := memory.NewStore(db)
 	vecStore := vectors.NewStore(db)
-	ontStore := ontology.NewStore(db)
+	mergedRels := ontology.MergedRelations(cfg.Ontology.Relations)
+	mergedTypes := ontology.MergedEntityTypes(cfg.Ontology.EntityTypes)
+	ontStore := ontology.NewStore(db, ontology.ValidRelationNames(mergedRels), ontology.ValidEntityTypeNames(mergedTypes))
 	embedder := embed.NewFromConfig(cfg)
+	chunkStore := memory.NewChunkStore(db)
 
 	// Pass 2: Concept extraction
 	extractModel := cfg.Models.Extract
@@ -107,8 +116,27 @@ func ReExtract(projectDir string) (*CompileResult, error) {
 			articleMaxTokens = 4000
 		}
 
+		relPatterns := ontology.RelationPatterns(mergedRels)
 		log.Info("Pass 3: writing articles", "concepts", len(concepts))
-		articles := WriteArticles(projectDir, cfg.Output, concepts, client, writeModel, articleMaxTokens, cfg.Compiler.MaxParallel, memStore, vecStore, ontStore, embedder)
+		articles := WriteArticles(ArticleWriteOpts{
+			ProjectDir:       projectDir,
+			OutputDir:        cfg.Output,
+			Client:           client,
+			Model:            writeModel,
+			MaxTokens:        articleMaxTokens,
+			MaxParallel:      cfg.Compiler.MaxParallel,
+			MemStore:         memStore,
+			VecStore:         vecStore,
+			OntStore:         ontStore,
+			ChunkStore:       chunkStore,
+			DB:               db,
+			Embedder:         embedder,
+			UserTZ:           cfg.Compiler.UserTimeLocation(),
+			ArticleFields:    cfg.Compiler.ArticleFields,
+			RelationPatterns: relPatterns,
+			ChunkSize:        cfg.Search.ChunkSizeOrDefault(),
+			Language:         cfg.Language,
+		}, concepts)
 
 		for _, ar := range articles {
 			if ar.Error != nil {

@@ -8,6 +8,7 @@ import (
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/xoai/sage-wiki/internal/compiler"
 	"github.com/xoai/sage-wiki/internal/linter"
+	"github.com/xoai/sage-wiki/internal/ontology"
 )
 
 func (s *Server) registerCompoundTools() {
@@ -16,6 +17,7 @@ func (s *Server) registerCompoundTools() {
 			mcplib.WithDescription("Run the full compile pipeline: diff → summarize → extract concepts → write articles."),
 			mcplib.WithBoolean("dry_run", mcplib.Description("Show what would change without writing")),
 			mcplib.WithBoolean("fresh", mcplib.Description("Ignore checkpoint, clean compile")),
+			mcplib.WithBoolean("prune", mcplib.Description("Remove orphaned articles whose sole source was deleted")),
 		),
 		s.handleCompile,
 	)
@@ -34,10 +36,12 @@ func (s *Server) handleCompile(ctx context.Context, req mcplib.CallToolRequest) 
 	args := req.GetArguments()
 	dryRun, _ := args["dry_run"].(bool)
 	fresh, _ := args["fresh"].(bool)
+	prune, _ := args["prune"].(bool)
 
 	result, err := compiler.Compile(s.projectDir, compiler.CompileOpts{
 		DryRun: dryRun,
 		Fresh:  fresh,
+		Prune:  prune,
 	})
 	if err != nil {
 		return errorResult(fmt.Sprintf("compile failed: %v", err)), nil
@@ -55,11 +59,15 @@ func (s *Server) handleLint(ctx context.Context, req mcplib.CallToolRequest) (*m
 	passName, _ := args["pass"].(string)
 	fix, _ := args["fix"].(bool)
 
+	mergedRels := ontology.MergedRelations(s.cfg.Ontology.Relations)
+	mergedTypes := ontology.MergedEntityTypes(s.cfg.Ontology.EntityTypes)
 	lintCtx := &linter.LintContext{
-		ProjectDir: s.projectDir,
-		OutputDir:  s.cfg.Output,
-		DBPath:     filepath.Join(s.projectDir, ".sage", "wiki.db"),
-		DB:         s.db,
+		ProjectDir:       s.projectDir,
+		OutputDir:        s.cfg.Output,
+		DBPath:           filepath.Join(s.projectDir, ".sage", "wiki.db"),
+		DB:               s.db,
+		ValidRelations:   ontology.ValidRelationNames(mergedRels),
+		ValidEntityTypes: ontology.ValidEntityTypeNames(mergedTypes),
 	}
 
 	runner := linter.NewRunner()

@@ -8,8 +8,9 @@ import (
 
 // openaiProvider implements the OpenAI-compatible API format.
 type openaiProvider struct {
-	apiKey  string
-	baseURL string
+	apiKey      string
+	baseURL     string
+	extraParams map[string]interface{} // provider-specific params merged into request body
 }
 
 func newOpenAIProvider(apiKey string, baseURL string) *openaiProvider {
@@ -46,14 +47,21 @@ func (p *openaiProvider) formatBody(messages []Message, opts CallOpts, stream bo
 		"model":    opts.Model,
 		"messages": apiMessages,
 	}
-	if stream {
-		body["stream"] = true
-	}
+	body["stream"] = stream
 	if opts.MaxTokens > 0 {
 		body["max_tokens"] = opts.MaxTokens
 	}
 	if opts.Temperature > 0 {
 		body["temperature"] = opts.Temperature
+	}
+	// Merge provider-specific extra params (e.g., enable_thinking, reasoning_effort).
+	// Protected keys cannot be overridden — they are structural to the request.
+	protected := map[string]bool{"model": true, "messages": true, "stream": true}
+	for k, v := range p.extraParams {
+		if protected[k] {
+			continue
+		}
+		body[k] = v
 	}
 	return body
 }
@@ -106,7 +114,12 @@ func (p *openaiProvider) ParseResponse(body []byte) (*Response, error) {
 		} `json:"choices"`
 		Model string `json:"model"`
 		Usage struct {
-			TotalTokens int `json:"total_tokens"`
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+			PromptTokensDetails struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 
@@ -122,5 +135,10 @@ func (p *openaiProvider) ParseResponse(body []byte) (*Response, error) {
 		Content:    result.Choices[0].Message.Content,
 		Model:      result.Model,
 		TokensUsed: result.Usage.TotalTokens,
+		Usage: Usage{
+			InputTokens:  result.Usage.PromptTokens,
+			OutputTokens: result.Usage.CompletionTokens,
+			CachedTokens: result.Usage.PromptTokensDetails.CachedTokens,
+		},
 	}, nil
 }

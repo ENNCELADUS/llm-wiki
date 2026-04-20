@@ -1,7 +1,18 @@
+# Claude
 .claude/
 CLAUDE.md
+.mcp.json
+
+# Sage
 .sage/
+.sage-memory/
+.sage-wiki/
 sage/
+
+# macOS
+.DS_Store
+
+# Build
 /sage-wiki
 .gocache/
 bin/

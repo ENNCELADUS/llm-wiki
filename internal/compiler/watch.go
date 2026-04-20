@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -18,9 +17,23 @@ import (
 // Watch monitors source directories for changes and triggers compilation.
 // It tries fsnotify first, then falls back to polling if no events are
 // received (common on WSL2 /mnt/ paths and network drives).
-func Watch(projectDir string, debounceSeconds int) error {
+// If coordinator is non-nil, it is used to serialize compiles with on-demand
+// requests. If nil, a local coordinator is created.
+func Watch(projectDir string, debounceSeconds int, opts CompileOpts, coordinator ...*CompileCoordinator) error {
+	var cc *CompileCoordinator
+	if len(coordinator) > 0 && coordinator[0] != nil {
+		cc = coordinator[0]
+	} else {
+		cc = NewCompileCoordinator()
+	}
 	if debounceSeconds <= 0 {
 		debounceSeconds = 2
+	}
+
+	// D5: reject watch when a pending batch exists on disk
+	statePath := filepath.Join(projectDir, ".sage", "compile-state.json")
+	if state, _ := loadCompileState(statePath); state != nil && state.Batch != nil {
+		return fmt.Errorf("pending batch compile detected; run 'sage-wiki compile' to complete it before starting watch mode")
 	}
 
 	cfgPath := filepath.Join(projectDir, "config.yaml")
@@ -31,9 +44,9 @@ func Watch(projectDir string, debounceSeconds int) error {
 
 	sourcePaths := cfg.ResolveSources(projectDir)
 
-	// Run initial compile to catch files added while watcher was stopped
+	// Run initial compile with full opts (including Fresh if set)
 	log.Info("running initial compile before watching")
-	if result, err := Compile(projectDir, CompileOpts{}); err != nil {
+	if result, err := Compile(projectDir, opts); err != nil {
 		log.Error("initial compile failed", "error", err)
 	} else if result.Added > 0 || result.Modified > 0 || result.Removed > 0 {
 		log.Info("initial compile complete",
@@ -45,6 +58,10 @@ func Watch(projectDir string, debounceSeconds int) error {
 	} else {
 		log.Info("initial compile: nothing new to process")
 	}
+
+	// D4: subsequent triggered compiles never use Fresh
+	triggerOpts := opts
+	triggerOpts.Fresh = false
 
 	// Try fsnotify first
 	watcher, fsErr := fsnotify.NewWatcher()
@@ -72,19 +89,18 @@ func Watch(projectDir string, debounceSeconds int) error {
 			watcher.Close()
 		}
 		log.Info("using polling mode (inotify unavailable for these paths)", "sources", sourcePaths, "interval", fmt.Sprintf("%ds", debounceSeconds*2))
-		return watchPoll(projectDir, sourcePaths, cfg.Ignore, debounceSeconds*2)
+		return watchPoll(projectDir, sourcePaths, cfg.Ignore, debounceSeconds*2, triggerOpts, cc)
 	}
 
 	defer watcher.Close()
 	log.Info("watching for changes (fsnotify)", "sources", sourcePaths, "debounce", debounceSeconds)
-	return watchFsnotify(projectDir, watcher, debounceSeconds)
+	return watchFsnotify(projectDir, watcher, debounceSeconds, triggerOpts, cc)
 }
 
 // watchFsnotify uses inotify-based watching (works on native Linux, macOS).
-func watchFsnotify(projectDir string, watcher *fsnotify.Watcher, debounceSeconds int) error {
+func watchFsnotify(projectDir string, watcher *fsnotify.Watcher, debounceSeconds int, opts CompileOpts, cc *CompileCoordinator) error {
 	debounce := time.Duration(debounceSeconds) * time.Second
 	var timer *time.Timer
-	var compileMu sync.Mutex
 	var lastTrigger string
 
 	for {
@@ -113,7 +129,7 @@ func watchFsnotify(projectDir string, watcher *fsnotify.Watcher, debounceSeconds
 			}
 			trigger := lastTrigger
 			timer = time.AfterFunc(debounce, func() {
-				triggerCompile(projectDir, trigger, &compileMu)
+				triggerCompile(projectDir, trigger, opts, cc)
 			})
 
 		case err, ok := <-watcher.Errors:
@@ -127,8 +143,7 @@ func watchFsnotify(projectDir string, watcher *fsnotify.Watcher, debounceSeconds
 
 // watchPoll periodically scans source directories for changes.
 // Works on WSL2 /mnt/ paths, network drives, and any filesystem.
-func watchPoll(projectDir string, sourcePaths []string, ignore []string, intervalSeconds int) error {
-	var compileMu sync.Mutex
+func watchPoll(projectDir string, sourcePaths []string, ignore []string, intervalSeconds int, opts CompileOpts, cc *CompileCoordinator) error {
 
 	// Build initial snapshot
 	snapshot := scanSnapshot(sourcePaths, ignore)
@@ -166,7 +181,7 @@ func watchPoll(projectDir string, sourcePaths []string, ignore []string, interva
 
 		if len(changed) > 0 {
 			log.Info("changes detected", "count", len(changed))
-			triggerCompile(projectDir, changed[0], &compileMu)
+			triggerCompile(projectDir, changed[0], opts, cc)
 		}
 	}
 
@@ -183,11 +198,13 @@ func scanSnapshot(sourcePaths []string, ignore []string) map[string]string {
 				return nil
 			}
 
-			// Check ignore list
-			for _, ign := range ignore {
-				if strings.Contains(path, ign) {
-					return nil
-				}
+			// Use relative path for consistent ignore matching with Diff
+			relPath, relErr := filepath.Rel(dir, path)
+			if relErr != nil {
+				relPath = path
+			}
+			if isIgnored(relPath, ignore) {
+				return nil
 			}
 
 			hash := quickHash(path)
@@ -224,23 +241,28 @@ func fullHash(path string) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-func triggerCompile(projectDir string, trigger string, compileMu *sync.Mutex) {
-	if !compileMu.TryLock() {
-		log.Info("compile already in progress, skipping", "trigger", trigger)
-		return
-	}
-	defer compileMu.Unlock()
+var compileFn = Compile
 
-	log.Info("compiling after change", "trigger", trigger)
-	result, err := Compile(projectDir, CompileOpts{})
-	if err != nil {
-		log.Error("compile failed", "error", err)
-	} else {
+func triggerCompile(projectDir string, trigger string, opts CompileOpts, cc *CompileCoordinator) {
+	ok, err := cc.TryCompile(func() error {
+		log.Info("compiling after change", "trigger", trigger)
+		result, err := compileFn(projectDir, opts)
+		if err != nil {
+			log.Error("compile failed", "error", err)
+			return err
+		}
 		log.Info("compile complete",
 			"summarized", result.Summarized,
 			"concepts", result.ConceptsExtracted,
 			"articles", result.ArticlesWritten,
 		)
+		return nil
+	})
+	if !ok {
+		log.Info("compile already in progress, skipping", "trigger", trigger)
+	}
+	if err != nil {
+		log.Error("triggered compile error", "error", err)
 	}
 }
 

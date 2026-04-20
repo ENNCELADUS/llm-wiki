@@ -61,7 +61,7 @@ func IngestURL(projectDir string, url string) (*IngestResult, error) {
 
 	// Convert to markdown-ish format (basic: wrap in frontmatter)
 	content := fmt.Sprintf("---\nsource_url: %s\ningested_at: %s\n---\n\n%s",
-		url, time.Now().UTC().Format(time.RFC3339), string(body))
+		url, cfg.Compiler.UserNow(), string(body))
 
 	// Find first article-type source folder
 	destDir := findSourceFolder(projectDir, cfg, "article")
@@ -111,7 +111,21 @@ func IngestPath(projectDir string, srcPath string) (*IngestResult, error) {
 		return nil, fmt.Errorf("ingest: file not found: %w", err)
 	}
 
-	srcType := extract.DetectSourceType(absPath)
+	var contentHead string
+	if len(cfg.TypeSignals) > 0 {
+		contentHead = extract.ReadHead(absPath, extract.DefaultHeadRunes)
+	}
+	signals := make([]extract.TypeSignal, len(cfg.TypeSignals))
+	for i, s := range cfg.TypeSignals {
+		signals[i] = extract.TypeSignal{
+			Type:             s.Type,
+			Pattern:          s.Pattern,
+			FilenameKeywords: s.FilenameKeywords,
+			ContentKeywords:  s.ContentKeywords,
+			MinContentHits:   s.MinContentHits,
+		}
+	}
+	srcType := extract.DetectSourceTypeWithSignals(absPath, contentHead, signals)
 	destDir := findSourceFolder(projectDir, cfg, srcType)
 	if destDir == "" {
 		// Fallback to first source folder

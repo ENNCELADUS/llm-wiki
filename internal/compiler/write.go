@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,12 +9,17 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
+	"unicode"
 
 	"github.com/xoai/sage-wiki/internal/embed"
+	"github.com/xoai/sage-wiki/internal/extract"
 	"github.com/xoai/sage-wiki/internal/llm"
 	"github.com/xoai/sage-wiki/internal/log"
 	"github.com/xoai/sage-wiki/internal/memory"
 	"github.com/xoai/sage-wiki/internal/ontology"
+	"github.com/xoai/sage-wiki/internal/prompts"
+	"github.com/xoai/sage-wiki/internal/storage"
 	"github.com/xoai/sage-wiki/internal/vectors"
 )
 
@@ -24,45 +30,77 @@ type ArticleResult struct {
 	Error       error
 }
 
+// ArticleWriteOpts bundles all parameters for WriteArticles / writeOneArticle.
+type ArticleWriteOpts struct {
+	ProjectDir       string
+	OutputDir        string
+	Client           *llm.Client
+	Model            string
+	MaxTokens        int
+	MaxParallel      int
+	MemStore         *memory.Store
+	VecStore         *vectors.Store
+	OntStore         *ontology.Store
+	ChunkStore       *memory.ChunkStore
+	DB               *storage.DB
+	Embedder         embed.Embedder
+	UserTZ           *time.Location
+	ArticleFields    []string
+	RelationPatterns []ontology.RelationPattern
+	ChunkSize        int // tokens per chunk (default 800)
+	SplitThreshold   int // chars — enable section-aware writing above this (default 15000)
+	Language         string
+	Backpressure     *BackpressureController // optional; if nil, uses fixed semaphore
+}
+
 // WriteArticles runs Pass 3: write concept articles with ontology edges.
-func WriteArticles(
-	projectDir string,
-	outputDir string,
-	concepts []ExtractedConcept,
-	client *llm.Client,
-	model string,
-	maxTokens int,
-	maxParallel int,
-	memStore *memory.Store,
-	vecStore *vectors.Store,
-	ontStore *ontology.Store,
-	embedder embed.Embedder,
-) []ArticleResult {
+func WriteArticles(opts ArticleWriteOpts, concepts []ExtractedConcept) []ArticleResult {
+	maxParallel := opts.MaxParallel
 	if maxParallel <= 0 {
-		maxParallel = 4
+		maxParallel = 20
 	}
 
 	results := make([]ArticleResult, len(concepts))
-	sem := make(chan struct{}, maxParallel)
 	var wg sync.WaitGroup
 	var done atomic.Int32
 	total := len(concepts)
 
+	// Use BackpressureController if available, otherwise fixed semaphore
+	var sem chan struct{}
+	if opts.Backpressure == nil {
+		sem = make(chan struct{}, maxParallel)
+	}
+
 	for i, concept := range concepts {
 		wg.Add(1)
-		sem <- struct{}{}
+
+		var release func()
+		if opts.Backpressure != nil {
+			release = opts.Backpressure.Acquire()
+		} else {
+			sem <- struct{}{}
+			release = func() { <-sem }
+		}
 
 		go func(idx int, c ExtractedConcept) {
 			defer wg.Done()
-			defer func() { <-sem }()
+			defer release()
 
-			result := writeOneArticle(projectDir, outputDir, c, client, model, maxTokens, memStore, vecStore, ontStore, embedder)
+			result := writeOneArticle(opts, c)
 			results[idx] = result
 
 			n := int(done.Add(1))
 			if result.Error != nil {
+				if opts.Backpressure != nil && llm.IsRateLimitError(result.Error) {
+					delay := opts.Backpressure.OnRateLimit()
+					log.Warn("rate limited in write pass, backing off", "delay", delay, "new_limit", opts.Backpressure.CurrentLimit())
+					time.Sleep(delay)
+				}
 				log.Error("write article failed", "progress", fmt.Sprintf("%d/%d", n, total), "concept", c.Name, "error", result.Error)
 			} else {
+				if opts.Backpressure != nil {
+					opts.Backpressure.OnSuccess()
+				}
 				log.Info("article written", "progress", fmt.Sprintf("%d/%d", n, total), "concept", c.Name)
 			}
 		}(i, concept)
@@ -72,36 +110,44 @@ func WriteArticles(
 	return results
 }
 
-func writeOneArticle(
-	projectDir string,
-	outputDir string,
-	concept ExtractedConcept,
-	client *llm.Client,
-	model string,
-	maxTokens int,
-	memStore *memory.Store,
-	vecStore *vectors.Store,
-	ontStore *ontology.Store,
-	embedder embed.Embedder,
-) ArticleResult {
+func writeOneArticle(opts ArticleWriteOpts, concept ExtractedConcept) ArticleResult {
 	result := ArticleResult{ConceptName: concept.Name}
 
 	// Check for existing article
-	articlePath := filepath.Join(outputDir, "concepts", concept.Name+".md")
-	absPath := filepath.Join(projectDir, articlePath)
+	articlePath := filepath.Join(opts.OutputDir, "concepts", concept.Name+".md")
+	absPath := filepath.Join(opts.ProjectDir, articlePath)
 	var existingContent string
 	if data, err := os.ReadFile(absPath); err == nil {
 		existingContent = string(data)
 	}
 
+	// Build source context from relevant sections (document splitting)
+	sourceContext := buildSourceContext(opts.ProjectDir, concept, opts.SplitThreshold)
+
 	// Build prompt
 	relatedNames := findRelatedConcepts(concept)
-	prompt := buildArticlePrompt(concept, existingContent, relatedNames)
+	prompt, err := prompts.Render("write_article", prompts.WriteArticleData{
+		ConceptName:     formatConceptName(concept.Name),
+		ConceptID:       concept.Name,
+		Sources:         strings.Join(concept.Sources, ", "),
+		RelatedConcepts: relatedNames,
+		ExistingArticle: existingContent,
+		Aliases:         strings.Join(concept.Aliases, ", "),
+		SourceList:      strings.Join(concept.Sources, ", "),
+		RelatedList:     strings.Join(relatedNames, ", "),
+		Confidence:      "medium",
+		MaxTokens:       opts.MaxTokens,
+		SourceContext:    sourceContext,
+	}, opts.Language)
+	if err != nil {
+		result.Error = fmt.Errorf("render write_article prompt: %w", err)
+		return result
+	}
 
-	resp, err := client.ChatCompletion([]llm.Message{
-		{Role: "system", Content: "You are a wiki author writing comprehensive, precise articles for a personal knowledge base. Use YAML frontmatter and [[wikilinks]]."},
+	resp, err := opts.Client.ChatCompletion([]llm.Message{
+		{Role: "system", Content: "You are a wiki author writing comprehensive, precise articles for a personal knowledge base. Use [[wikilinks]] for cross-references. Do not include YAML frontmatter."},
 		{Role: "user", Content: prompt},
-	}, llm.CallOpts{Model: model, MaxTokens: maxTokens})
+	}, llm.CallOpts{Model: opts.Model, MaxTokens: opts.MaxTokens})
 	if err != nil {
 		result.Error = fmt.Errorf("llm call: %w", err)
 		return result
@@ -109,20 +155,21 @@ func writeOneArticle(
 
 	articleContent := resp.Content
 
-	// Ensure frontmatter exists
-	if !strings.HasPrefix(articleContent, "---") {
-		articleContent = buildFrontmatter(concept) + "\n\n" + articleContent
-	}
+	// Strip any LLM-generated frontmatter — code builds frontmatter from ground-truth data.
+	articleContent = stripLLMFrontmatter(articleContent)
 
-	// Normalize confidence values to enum (high/medium/low)
-	articleContent = normalizeConfidence(articleContent)
+	// Extract LLM-judged fields (confidence + any custom fields from config)
+	fields, articleContent := extractFields(articleContent, opts.ArticleFields)
+
+	// Build frontmatter: ground-truth fields + LLM-judged fields
+	articleContent = buildFrontmatter(concept, fields, opts.ArticleFields, opts.UserTZ) + "\n\n" + articleContent
 
 	// Note: wikilinks are kept even if targets don't exist yet.
 	// Future compiles will create the missing articles, and the links
 	// will resolve naturally. Broken links are surfaced by `sage-wiki lint`.
 
 	// Write article file
-	articleDir := filepath.Join(projectDir, outputDir, "concepts")
+	articleDir := filepath.Join(opts.ProjectDir, opts.OutputDir, "concepts")
 	os.MkdirAll(articleDir, 0755)
 
 	if err := os.WriteFile(absPath, []byte(articleContent), 0644); err != nil {
@@ -131,15 +178,14 @@ func writeOneArticle(
 	}
 	result.ArticlePath = articlePath
 
-	// Create ontology entity
-	entityType := ontology.TypeConcept
-	if concept.Type == "technique" {
-		entityType = ontology.TypeTechnique
-	} else if concept.Type == "claim" {
-		entityType = ontology.TypeClaim
+	// Create ontology entity — pass through LLM-assigned type if valid,
+	// fall back to concept for unknown or empty types.
+	entityType := concept.Type
+	if entityType == "" || !opts.OntStore.IsValidType(entityType) {
+		entityType = ontology.TypeConcept
 	}
 
-	if err := ontStore.AddEntity(ontology.Entity{
+	if err := opts.OntStore.AddEntity(ontology.Entity{
 		ID:          concept.Name,
 		Type:        entityType,
 		Name:        formatConceptName(concept.Name),
@@ -151,14 +197,14 @@ func writeOneArticle(
 	// Create source citation relations
 	for _, src := range concept.Sources {
 		// Create source entity if not exists
-		if err := ontStore.AddEntity(ontology.Entity{
+		if err := opts.OntStore.AddEntity(ontology.Entity{
 			ID:   src,
 			Type: ontology.TypeSource,
 			Name: filepath.Base(src),
 		}); err != nil {
 			log.Warn("failed to create source entity", "source", src, "error", err)
 		}
-		if err := ontStore.AddRelation(ontology.Relation{
+		if err := opts.OntStore.AddRelation(ontology.Relation{
 			ID:       concept.Name + "-cites-" + sanitizeID(src),
 			SourceID: concept.Name,
 			TargetID: src,
@@ -169,10 +215,10 @@ func writeOneArticle(
 	}
 
 	// Extract typed relations from article text
-	extractRelations(concept.Name, articleContent, ontStore)
+	extractRelations(concept.Name, articleContent, opts.OntStore, opts.RelationPatterns)
 
 	// Index in FTS5
-	if err := memStore.Add(memory.Entry{
+	if err := opts.MemStore.Add(memory.Entry{
 		ID:          "concept:" + concept.Name,
 		Content:     articleContent,
 		Tags:        append([]string{entityType}, concept.Aliases...),
@@ -182,78 +228,198 @@ func writeOneArticle(
 	}
 
 	// Generate embedding
-	if embedder != nil {
-		vec, err := embedder.Embed(articleContent)
+	if opts.Embedder != nil {
+		vec, err := opts.Embedder.Embed(articleContent)
 		if err != nil {
 			log.Warn("embedding failed for article", "concept", concept.Name, "error", err)
 		} else {
-			vecStore.Upsert("concept:"+concept.Name, vec)
+			opts.VecStore.Upsert("concept:"+concept.Name, vec)
+		}
+	}
+
+	// Index chunks for enhanced search
+	if opts.ChunkStore != nil && opts.DB != nil {
+		chunkSize := opts.ChunkSize
+		if chunkSize <= 0 {
+			chunkSize = 800
+		}
+		docID := "concept:" + concept.Name
+		chunks := extract.ChunkText(articleContent, chunkSize)
+
+		// Embed all chunks FIRST (API calls outside transaction)
+		var chunkEmbeddings [][]float32
+		if opts.Embedder != nil {
+			chunkEmbeddings = make([][]float32, len(chunks))
+			for i, c := range chunks {
+				vec, err := opts.Embedder.Embed(c.Text)
+				if err != nil {
+					log.Warn("chunk embedding failed", "concept", concept.Name, "chunk", i, "error", err)
+				} else {
+					chunkEmbeddings[i] = vec
+				}
+			}
+		}
+
+		// Single WriteTx: delete old + insert new
+		if err := opts.DB.WriteTx(func(tx *sql.Tx) error {
+			if err := opts.ChunkStore.DeleteDocChunks(tx, docID); err != nil {
+				return err
+			}
+
+			entries := make([]memory.ChunkEntry, len(chunks))
+			for i, c := range chunks {
+				entries[i] = memory.ChunkEntry{
+					ChunkID:    fmt.Sprintf("%s:c%d", docID, i),
+					ChunkIndex: c.Index,
+					Heading:    c.Heading,
+					Content:    c.Text,
+				}
+			}
+
+			if err := opts.ChunkStore.IndexChunks(tx, docID, entries); err != nil {
+				return err
+			}
+
+			// Insert pre-computed chunk embeddings
+			if chunkEmbeddings != nil {
+				for i, emb := range chunkEmbeddings {
+					if emb != nil {
+						if err := opts.VecStore.UpsertChunk(tx, entries[i].ChunkID, docID, emb); err != nil {
+							log.Warn("chunk vector upsert failed", "chunk", entries[i].ChunkID, "error", err)
+						}
+					}
+				}
+			}
+
+			return nil
+		}); err != nil {
+			log.Error("chunk indexing failed", "concept", concept.Name, "error", err)
 		}
 	}
 
 	return result
 }
 
-func buildArticlePrompt(concept ExtractedConcept, existing string, related []string) string {
-	var b strings.Builder
-
-	b.WriteString(fmt.Sprintf("Write a comprehensive wiki article about: %s\n\n", formatConceptName(concept.Name)))
-	b.WriteString(fmt.Sprintf("Concept ID: %s\n", concept.Name))
-
-	if len(concept.Aliases) > 0 {
-		b.WriteString(fmt.Sprintf("Also known as: %s\n", strings.Join(concept.Aliases, ", ")))
-	}
-
-	b.WriteString(fmt.Sprintf("Sources: %s\n", strings.Join(concept.Sources, ", ")))
-
-	if len(related) > 0 {
-		b.WriteString(fmt.Sprintf("Related concepts: %s\n", strings.Join(related, ", ")))
-	}
-
-	if existing != "" {
-		b.WriteString("\n## Existing article (update/expand):\n")
-		b.WriteString(existing)
-		b.WriteString("\n")
-	}
-
-	b.WriteString(`
-Write the article with:
-1. YAML frontmatter with these exact fields:
-   - concept: (the concept ID)
-   - aliases: (alternative names)
-   - sources: (source file paths)
-   - confidence: MUST be exactly one of: high, medium, low (no numbers, no percentages)
-2. ## Definition — clear, precise definition
-3. ## How it works — technical explanation
-4. ## Variants — known variants or implementations if any
-5. ## Trade-offs — key trade-offs or limitations
-6. ## See also — [[wikilinks]] to related concepts
-
-IMPORTANT rules for wikilinks:
-- Use [[concept-name]] format (lowercase-hyphenated)
-- Link to any concept that deserves a standalone article — even if the article doesn't exist yet (it will be created in future compiles)
-- Do NOT link to generic terms, math notation ($O(n)$), or register names ($a0)
-- Each link should be a meaningful technical concept, not filler
-
-For the concept's relationship to other concepts, indicate the relationship type in your text:
-- "X implements Y" / "X extends Y" / "X optimizes Y"
-- "X contradicts Y" / "X is a prerequisite for Y"
-This helps build the knowledge graph.`)
-
-	return b.String()
-}
-
-func buildFrontmatter(concept ExtractedConcept) string {
+func buildFrontmatter(concept ExtractedConcept, fields map[string]string, fieldOrder []string, loc *time.Location) string {
 	aliases := quoteYAMLList(concept.Aliases)
 	sources := quoteYAMLList(concept.Sources)
 
-	return fmt.Sprintf(`---
-concept: %s
-aliases: %s
-sources: %s
-confidence: medium
-created_at: %s
----`, concept.Name, aliases, sources, timeNow())
+	confidence := fields["confidence"]
+	if confidence == "" {
+		confidence = "medium"
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "---\nconcept: %s\naliases: %s\nsources: %s\nconfidence: %s",
+		concept.Name, aliases, sources, confidence)
+
+	// Append custom fields in declared order (deterministic)
+	for _, k := range fieldOrder {
+		if v := fields[k]; v != "" {
+			fmt.Fprintf(&b, "\n%s: %s", k, v)
+		}
+	}
+
+	fmt.Fprintf(&b, "\ncreated_at: %s\n---", timeNow(loc))
+	return b.String()
+}
+
+// extractFields scans the tail of the LLM response for "Key: value" lines matching
+// the given field names, removes them from the body, and returns a map of extracted values.
+// Only the last 15 lines are scanned to avoid false positives in article body text.
+// "confidence" is always extracted and normalized via mapConfidence.
+// LLMs may format keys with bold markdown (**Key:** or **Key**:), which is handled.
+func extractFields(content string, fieldNames []string) (fields map[string]string, cleaned string) {
+	// Build lookup set: always include "confidence"
+	want := map[string]bool{"confidence": true}
+	for _, f := range fieldNames {
+		want[strings.ToLower(strings.TrimSpace(f))] = true
+	}
+
+	fields = make(map[string]string)
+	lines := strings.Split(content, "\n")
+
+	// Only scan the last 15 lines to avoid false positives in article body
+	scanStart := 0
+	if len(lines) > 15 {
+		scanStart = len(lines) - 15
+	}
+
+	var kept []string
+	kept = append(kept, lines[:scanStart]...)
+
+	for _, line := range lines[scanStart:] {
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+
+		// Strip bold/backtick markdown: **Key:** value, **Key**: value, `Key`: value
+		stripped := strings.TrimLeft(lower, "*`")
+		stripped = strings.TrimSpace(stripped)
+
+		matched := false
+		for name := range want {
+			// Match "name:" or "name**:" or "name`:" patterns
+			prefix := name + ":"
+			altPrefix := name + "**:"
+			if strings.HasPrefix(stripped, prefix) || strings.HasPrefix(stripped, altPrefix) {
+				// Extract value after the colon
+				colonIdx := strings.Index(lower, ":")
+				if colonIdx >= 0 {
+					value := strings.TrimSpace(trimmed[colonIdx+1:])
+					value = strings.Trim(value, "*` ")
+					if name == "confidence" {
+						value = mapConfidence(value)
+					}
+					fields[name] = value
+				}
+				matched = true
+				break
+			}
+		}
+
+		if !matched {
+			kept = append(kept, line)
+		}
+	}
+
+	// Default confidence if not found
+	if _, ok := fields["confidence"]; !ok {
+		fields["confidence"] = "medium"
+	}
+
+	return fields, strings.TrimSpace(strings.Join(kept, "\n"))
+}
+
+// stripLLMFrontmatter removes any frontmatter block the LLM may have generated.
+// Handles bare (---\n...\n---) and code-fenced (```yaml\n---\n...\n---\n```) formats.
+func stripLLMFrontmatter(content string) string {
+	s := strings.TrimSpace(content)
+
+	// Case 1: code-fenced frontmatter — ```yaml\n---\n...\n---\n```
+	if strings.HasPrefix(s, "```") {
+		// Find the closing fence
+		firstNewline := strings.Index(s, "\n")
+		if firstNewline < 0 {
+			return s
+		}
+		rest := s[firstNewline+1:]
+		closeFence := strings.Index(rest, "```")
+		if closeFence >= 0 {
+			s = strings.TrimSpace(rest[closeFence+3:])
+			// The inner block may itself be bare frontmatter — fall through
+		}
+	}
+
+	// Case 2: bare frontmatter — ---\n...\n---
+	if strings.HasPrefix(s, "---") {
+		// Find the closing ---
+		after := s[3:]
+		if idx := strings.Index(after, "\n---"); idx >= 0 {
+			s = strings.TrimSpace(after[idx+4:])
+		}
+	}
+
+	return s
 }
 
 // quoteYAMLList produces a YAML list with properly quoted values.
@@ -271,8 +437,10 @@ func quoteYAMLList(items []string) string {
 func formatConceptName(name string) string {
 	words := strings.Split(name, "-")
 	for i, w := range words {
-		if len(w) > 0 {
-			words[i] = strings.ToUpper(w[:1]) + w[1:]
+		runes := []rune(w)
+		if len(runes) > 0 {
+			runes[0] = unicode.ToUpper(runes[0])
+			words[i] = string(runes)
 		}
 	}
 	return strings.Join(words, " ")
@@ -286,7 +454,7 @@ func findRelatedConcepts(concept ExtractedConcept) []string {
 
 // extractRelations parses article text for relationship patterns and creates ontology edges.
 // Looks for patterns like "X implements Y", "X extends Y", etc. near [[wikilinks]].
-func extractRelations(conceptID string, content string, ontStore *ontology.Store) {
+func extractRelations(conceptID string, content string, ontStore *ontology.Store, patterns []ontology.RelationPattern) {
 	linkRe := regexp.MustCompile(`\[\[([^\]]+)\]\]`)
 	links := linkRe.FindAllStringSubmatch(content, -1)
 
@@ -301,30 +469,17 @@ func extractRelations(conceptID string, content string, ontStore *ontology.Store
 
 	contentLower := strings.ToLower(content)
 
-	// Pattern matching for relation types
-	relationPatterns := []struct {
-		keywords []string
-		relation string
-	}{
-		{[]string{"implements", "implementation of", "is an implementation"}, ontology.RelImplements},
-		{[]string{"extends", "extension of", "builds on", "builds upon"}, ontology.RelExtends},
-		{[]string{"optimizes", "optimization of", "improves upon", "faster than"}, ontology.RelOptimizes},
-		{[]string{"contradicts", "conflicts with", "disagrees with", "challenges"}, ontology.RelContradicts},
-		{[]string{"prerequisite", "requires knowledge of", "depends on", "built on top of"}, ontology.RelPrerequisiteOf},
-		{[]string{"trade-off", "tradeoff", "trades off", "at the cost of"}, ontology.RelTradesOff},
-	}
-
 	for target := range linkedConcepts {
 		targetLower := strings.ToLower(target)
-		for _, rp := range relationPatterns {
-			for _, keyword := range rp.keywords {
+		for _, rp := range patterns {
+			for _, keyword := range rp.Keywords {
 				// Look for the keyword near the concept mention
 				if strings.Contains(contentLower, keyword) && strings.Contains(contentLower, targetLower) {
 					ontStore.AddRelation(ontology.Relation{
-						ID:       conceptID + "-" + rp.relation + "-" + target,
+						ID:       conceptID + "-" + rp.Relation + "-" + target,
 						SourceID: conceptID,
 						TargetID: target,
-						Relation: rp.relation,
+						Relation: rp.Relation,
 					})
 					break // one relation type per target is enough
 				}
@@ -335,23 +490,6 @@ func extractRelations(conceptID string, content string, ontStore *ontology.Store
 
 func sanitizeID(s string) string {
 	return strings.NewReplacer("/", "-", "\\", "-", ".", "-", " ", "-").Replace(s)
-}
-
-// normalizeConfidence replaces non-standard confidence values in frontmatter
-// with the enum (high/medium/low).
-func normalizeConfidence(content string) string {
-	// Find confidence line in frontmatter
-	lines := strings.Split(content, "\n")
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "confidence:") {
-			value := strings.TrimSpace(strings.TrimPrefix(trimmed, "confidence:"))
-			normalized := mapConfidence(value)
-			lines[i] = "confidence: " + normalized
-			break
-		}
-	}
-	return strings.Join(lines, "\n")
 }
 
 func mapConfidence(value string) string {
@@ -385,4 +523,59 @@ func validateWikilinks(projectDir, outputDir, content string) string {
 		// Link is broken — return just the text without brackets
 		return target
 	})
+}
+
+// buildSourceContext reads source files for a concept, splits large ones
+// by headings, and returns the relevant sections as context for article writing.
+// For small sources (below threshold), includes the full content.
+// Returns empty string if no sources can be read.
+func buildSourceContext(projectDir string, concept ExtractedConcept, threshold int) string {
+	if threshold <= 0 {
+		threshold = 15000 // default from spec
+	}
+
+	var parts []string
+	terms := append([]string{concept.Name, formatConceptName(concept.Name)}, concept.Aliases...)
+
+	for _, srcPath := range concept.Sources {
+		absPath := filepath.Join(projectDir, srcPath)
+		data, err := os.ReadFile(absPath)
+		if err != nil {
+			continue
+		}
+		content := string(data)
+
+		sections := extract.SplitByHeadings(content, threshold)
+		if len(sections) <= 1 {
+			// Small doc or no headings — include as-is (truncated)
+			if len(content) > 4000 {
+				content = content[:4000] + "\n[...truncated...]"
+			}
+			parts = append(parts, fmt.Sprintf("### Source: %s\n\n%s", srcPath, content))
+			continue
+		}
+
+		// Large doc — select relevant sections only
+		relevant := extract.SectionsContaining(sections, terms)
+		if len(relevant) == 0 {
+			// No sections match — use first section as fallback
+			if len(sections) > 0 {
+				relevant = sections[:1]
+			}
+		}
+
+		for _, s := range relevant {
+			header := srcPath
+			if s.Heading != "" {
+				header = srcPath + " > " + s.Heading
+			}
+			text := s.Content
+			if len(text) > 4000 {
+				text = text[:4000] + "\n[...truncated...]"
+			}
+			parts = append(parts, fmt.Sprintf("### Source: %s\n\n%s", header, text))
+		}
+	}
+
+	return strings.Join(parts, "\n\n---\n\n")
 }
